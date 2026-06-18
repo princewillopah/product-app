@@ -1,0 +1,39 @@
+spring:
+  application:
+    name: product-service
+  data:
+    mongodb:
+      uri: ${MONGO_URI:mongodb://mongodb:27017/products_db}
+      auto-index-creation: true
+
+server:
+  port: 8001
+  servlet:
+    context-path: /
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      slo:
+        http.server.requests: 100ms,500ms,1s
+  tracing:
+    sampling:
+      probability: 1.0
+
+logging:
+  level:
+    root: INFO
+    com.observability: DEBUG
+  config: classpath:logback-spring.xml

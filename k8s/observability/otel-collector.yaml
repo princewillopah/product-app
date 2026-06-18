@@ -1,0 +1,359 @@
+---
+# OpenTelemetry Collector - Centralized Telemetry Pipeline
+# Receives OTLP traces/metrics/logs from all services
+# Exports to Tempo (traces), Prometheus (metrics), Loki (logs)
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability-stack
+  labels:
+    app: otel-collector
+data:
+  collector-config.yaml: |
+    # ========================================================================
+    # RECEIVERS - Protocols for accepting telemetry
+    # ========================================================================
+    receivers:
+      # OTLP receiver for traces, metrics, logs
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+            max_recv_msg_size_mb: 10
+          http:
+            endpoint: 0.0.0.0:4318
+            cors:
+              allowed_origins:
+                - http://localhost:*
+                - http://127.0.0.1:*
+      
+      # Prometheus receiver for self-monitoring
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: 'otel-collector'
+              scrape_interval: 30s
+              static_configs:
+                - targets: ['localhost:8888']
+      
+      # Jaeger gRPC receiver (legacy support)
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:14250
+          thrift_http:
+            endpoint: 0.0.0.0:14268
+
+    # ========================================================================
+    # PROCESSORS - Transform & enrich telemetry data
+    # ========================================================================
+    processors:
+      # Batch processor - accumulates data for efficiency
+      batch:
+        send_batch_size: 1024
+        timeout: 10s
+        send_batch_max_size: 4096
+      
+      # Memory limiter - prevents OOM
+      memory_limiter:
+        check_interval: 5s
+        limit_mib: 512
+        spike_limit_mib: 128
+      
+      # Attributes processor - add common attributes
+      attributes:
+        actions:
+          - key: environment
+            value: production
+            action: upsert
+          - key: cluster
+            value: local
+            action: upsert
+      
+      # Resource detection - auto-detect K8s attributes
+      resourcedetection:
+        detectors: [kubernetes, docker, system]
+        timeout: 2s
+        override: true
+      
+      # Sampling processor - sample traces for cost control (optional)
+      sampling:
+        sampling_percentage: 100  # 100% = keep all traces (change to 10 for 10% sampling)
+
+    # ========================================================================
+    # EXPORTERS - Send telemetry to backends
+    # ========================================================================
+    exporters:
+      # Tempo - Distributed tracing backend
+      otlp:
+        endpoint: tempo:4317
+        tls:
+          insecure: true
+      
+      # Prometheus - Metrics backend
+      prometheusremotewrite:
+        endpoint: "http://kube-prometheus-stack-prometheus:9090/api/v1/write"
+        resource_to_telemetry_conversion:
+          enabled: true
+      
+      # Loki - Logs backend
+      loki:
+        endpoint: http://loki:3100/loki/api/v1/push
+        resource_to_telemetry_conversion:
+          enabled: true
+      
+      # Logging exporter - debug output (disable in production)
+      logging:
+        loglevel: debug
+
+    # ========================================================================
+    # SERVICE - Pipeline configuration
+    # ========================================================================
+    service:
+      pipelines:
+        # Traces pipeline
+        traces:
+          receivers: [otlp, jaeger]
+          processors: [memory_limiter, resourcedetection, attributes, batch]
+          exporters: [otlp, logging]  # Remove logging in production
+        
+        # Metrics pipeline
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [memory_limiter, resourcedetection, attributes, batch]
+          exporters: [prometheusremotewrite, logging]  # Remove logging in production
+        
+        # Logs pipeline
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, attributes, batch]
+          exporters: [loki, logging]  # Remove logging in production
+      
+      extensions: [health_check, pprof]
+
+---
+# OpenTelemetry Collector Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: observability-stack
+  labels:
+    app: otel-collector
+    version: v0.95.0
+spec:
+  replicas: 2  # HA setup
+  selector:
+    matchLabels:
+      app: otel-collector
+  
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+        monitoring: "true"  # For PodMonitor scraping
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+        prometheus.io/path: "/metrics"
+    
+    spec:
+      serviceAccountName: otel-collector
+      
+      # Pod Anti-affinity - spread across nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [otel-collector]
+                topologyKey: kubernetes.io/hostname
+      
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.95.0
+          imagePullPolicy: IfNotPresent
+          
+          # Ports
+          ports:
+            # OTLP gRPC
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            # OTLP HTTP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            # Jaeger gRPC
+            - name: jaeger-grpc
+              containerPort: 14250
+              protocol: TCP
+            # Jaeger HTTP
+            - name: jaeger-http
+              containerPort: 14268
+              protocol: TCP
+            # Metrics (Prometheus format)
+            - name: metrics
+              containerPort: 8888
+              protocol: TCP
+            # Health check
+            - name: health
+              containerPort: 13133
+              protocol: TCP
+          
+          # Environment variables
+          env:
+            - name: GOGC
+              value: "80"  # Go garbage collection tuning
+            - name: OTEL_TRACES_EXPORTER
+              value: "otlp"
+            - name: OTEL_METRICS_EXPORTER
+              value: "prometheus"
+            - name: OTEL_LOGS_EXPORTER
+              value: "loki"
+          
+          # Config mount
+          volumeMounts:
+            - name: otel-collector-config
+              mountPath: /etc/otel/config.yaml
+              subPath: collector-config.yaml
+          
+          # Resource requests (production-grade)
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          
+          # Probes
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          # Security context
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534  # nobody - otel-collector-contrib runs fine as non-root
+            runAsGroup: 65534
+            capabilities:
+              drop:
+                - ALL
+      
+      # Volumes
+      volumes:
+        - name: otel-collector-config
+          configMap:
+            name: otel-collector-config
+
+---
+# OpenTelemetry Collector Service (ClusterIP - internal only)
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: observability-stack
+  labels:
+    app: otel-collector
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8888"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app: otel-collector
+  ports:
+    # OTLP gRPC (standard port for traces/metrics/logs)
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    
+    # OTLP HTTP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+    
+    # Jaeger gRPC (legacy)
+    - name: jaeger-grpc
+      port: 14250
+      targetPort: 14250
+      protocol: TCP
+    
+    # Jaeger HTTP (legacy)
+    - name: jaeger-http
+      port: 14268
+      targetPort: 14268
+      protocol: TCP
+    
+    # Metrics
+    - name: metrics
+      port: 8888
+      targetPort: 8888
+      protocol: TCP
+
+---
+# ServiceAccount & RBAC for OTEL Collector
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: observability-stack
+  labels:
+    app: otel-collector
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+  labels:
+    app: otel-collector
+rules:
+  # For resourcedetection processor
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+  labels:
+    app: otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: observability-stack
+

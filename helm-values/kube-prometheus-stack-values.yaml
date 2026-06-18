@@ -1,0 +1,436 @@
+# kube-prometheus-stack Helm Chart Values
+# Repository: https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack
+# Version: 60.0.0+ (supports k8s 1.25+)
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ============================================================================
+# PROMETHEUS OPERATOR (CRD management)
+# ============================================================================
+prometheusOperator:
+  enabled: true
+  
+  # Pod security
+  podSecurityPolicy:
+    enabled: false  # Use Pod Security Standards instead
+  
+  # RBAC
+  rbac:
+    create: true
+  
+  # Service Account
+  serviceAccount:
+    create: true
+    name: "prometheus-operator"
+
+  # Resource requests
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# ============================================================================
+# PROMETHEUS (Metrics collection & storage)
+# ============================================================================
+prometheus:
+  enabled: true
+  
+  # Prometheus Operator's Prometheus custom resource
+  prometheusSpec:
+    # Image
+    image:
+      registry: quay.io
+      repository: prometheus/prometheus
+      tag: v2.50.0
+      pullPolicy: IfNotPresent
+    
+    # Resource allocation (production-grade)
+    resources:
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+      requests:
+        cpu: 500m
+        memory: 1Gi
+    
+    # Storage
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: standard  # Use local Kind storage class
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi  # Typical: 24h retention at 20 req/sec = ~10GB
+    
+    # Retention
+    retention: 15d  # 15-day retention for production
+    retentionSize: "45GB"
+    
+    # Scrape configuration
+    scrapeInterval: 30s
+    scrapeTimeout: 10s
+    evaluationInterval: 30s
+    
+    # Service Monitor Selector (discovers ServiceMonitors across all namespaces)
+    serviceMonitorSelectorNilUsesHelmValues: false  # Select all ServiceMonitor
+    serviceMonitorNamespaceSelector: {}  # From all namespaces
+    
+    # Pod Monitor Selector
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorNamespaceSelector: {}
+    
+    # Probe Selector (for Prometheus Probe CRD)
+    probesSelectorNilUsesHelmValues: false
+    probesNamespaceSelector: {}
+    
+    # Rule Selector (discovers PrometheusRule CRDs)
+    ruleSelectorNilUsesHelmValues: false
+    ruleNamespaceSelector: {}
+    
+    # Alert routing
+    alertingSpec:
+      alertmanagers:
+        - namespace: observability-stack
+          name: alertmanager
+          port: web
+          pathPrefix: "/"
+    
+    # External labels (added to all metrics)
+    externalLabels:
+      cluster: "local"
+      environment: "dev"  # Change per environment
+      region: "us-east-1"
+    
+    # Security Context
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65534
+      fsGroup: 65534
+    
+    # Affinity (prefer different nodes)
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: [prometheus]
+              topologyKey: kubernetes.io/hostname
+
+  # Prometheus Service
+  service:
+    type: ClusterIP
+    port: 9090
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9090"
+
+# ============================================================================
+# ALERTMANAGER (Alert aggregation & routing)
+# ============================================================================
+alertmanager:
+  enabled: true
+  
+  # Alertmanager Operator custom resource
+  alertmanagerSpec:
+    image:
+      registry: quay.io
+      repository: prometheus/alertmanager
+      tag: v0.26.0
+      pullPolicy: IfNotPresent
+    
+    # Resource allocation
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+    
+    # Storage for alert history
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: standard
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+    
+    # Retention (how long to keep alert history)
+    retention: 120h
+    
+    # Security Context
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65534
+      fsGroup: 65534
+    
+    # Pod Anti-affinity
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: [alertmanager]
+              topologyKey: kubernetes.io/hostname
+  
+  # AlertManager configuration (YAML)
+  config:
+    global:
+      resolve_timeout: 5m
+      slack_api_url: "${SLACK_WEBHOOK_URL}"  # Set via secret
+      pagerduty_url: "https://events.pagerduty.com/v2/enqueue"
+    
+    templates:
+      - '/etc/alertmanager/config/alertmanager-notification-templates.tmpl'
+    
+    route:
+      receiver: 'default'
+      group_by: ['alertname', 'job', 'severity']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      
+      # Routing rules by severity
+      routes:
+        # Critical alerts → PagerDuty + Slack
+        - match:
+            severity: critical
+          receiver: 'pagerduty-critical'
+          group_wait: 10s
+          group_interval: 5m
+          repeat_interval: 1h
+          
+        # Warning alerts → Slack only
+        - match:
+            severity: warning
+          receiver: 'slack-warnings'
+          group_wait: 1m
+          group_interval: 15m
+          repeat_interval: 24h
+    
+    receivers:
+      - name: 'default'
+        slack_configs:
+          - channel: '#alerts'
+            title: 'Notification'
+            text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+      
+      - name: 'pagerduty-critical'
+        slack_configs:
+          - channel: '#incidents'
+            title: '🚨 CRITICAL'
+            text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+        pagerduty_configs:
+          - service_key: "${PAGERDUTY_INTEGRATION_KEY}"
+            description: '{{ .GroupLabels.alertname }}'
+      
+      - name: 'slack-warnings'
+        slack_configs:
+          - channel: '#alerts'
+            title: '⚠️ Warning'
+            text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+    
+    inhibit_rules:
+      # Critical alert suppresses warnings for same alertname/job
+      - source_match:
+          severity: critical
+        target_match:
+          severity: warning
+        equal: ['alertname', 'job']
+
+  # AlertManager Service
+  service:
+    type: ClusterIP
+    port: 9093
+
+# ============================================================================
+# GRAFANA (Visualization & Dashboards)
+# ============================================================================
+grafana:
+  enabled: false  # Deploy Grafana separately with simpler config to avoid provisioning errors
+  
+  # Image
+  image:
+    registry: docker.io
+    repository: grafana/grafana
+    tag: 10.2.0
+  
+  # Resource limits
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  
+  # Data persistence
+  persistence:
+    enabled: true
+    storageClassName: standard
+    size: 5Gi
+  
+  # Data source provisioning (auto-add Prometheus only; add Loki/Tempo later)
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        # Prometheus
+        - name: Prometheus
+          type: prometheus
+          url: http://kube-prometheus-stack-prometheus:9090
+          access: proxy
+          isDefault: true
+          editable: true
+          jsonData:
+            timeInterval: 30s
+  
+  # Dashboard provisioning
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: 'default'
+          orgId: 1
+          folder: ''
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+  
+  dashboards:
+    default:
+      prometheus-stats:
+        url: https://grafana.com/api/dashboards/15291/revisions/1/download
+      kubernetes-cluster:
+        url: https://grafana.com/api/dashboards/7249/revisions/1/download
+      microservices:
+        url: https://grafana.com/api/dashboards/1860/revisions/23/download
+  
+  # Service
+  service:
+    type: ClusterIP
+    port: 80
+
+# ============================================================================
+# NODE EXPORTER (System metrics from all nodes)
+# ============================================================================
+nodeExporter:
+  enabled: true
+  
+  resources:
+    limits:
+      cpu: 200m
+      memory: 128Mi
+    requests:
+      cpu: 100m
+      memory: 64Mi
+
+# ============================================================================
+# KUBE-STATE-METRICS (Kubernetes resource metrics)
+# ============================================================================
+kubeStateMetrics:
+  enabled: true
+  
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+# ============================================================================
+# PROMETHEUS NODE EXPORTER
+# ============================================================================
+prometheus-node-exporter:
+  tolerations:
+    - effect: NoSchedule
+      operator: Exists
+    - effect: NoExecute
+      operator: Exists
+
+# ============================================================================
+# DEFAULT SERVICE MONITORS (for Prometheus components themselves)
+# ============================================================================
+prometheus-node-exporter:
+  serviceMonitor:
+    enabled: true
+    namespace: observability-stack
+
+kubeControllerManager:
+  enabled: true
+  namespace: kube-system
+
+kubeEtcd:
+  enabled: true
+  namespace: kube-system
+
+kubeSchedulerAlerting:
+  enabled: true
+  namespace: kube-system
+
+kubeProxy:
+  enabled: true
+  namespace: kube-system
+
+kubeStateMetrics:
+  enabled: true
+
+nodeExporter:
+  enabled: true
+
+prometheus:
+  monitor:
+    enabled: true
+    namespace: observability-stack
+
+# ============================================================================
+# ADDITIONAL SETTINGS
+# ============================================================================
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: true
+    kubernetes: true
+    kubeApiserverAvailability: true
+    kubeApiserverSlos: true
+    kubelet: true
+    kubeProxy: true
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    kubeScheduler: true
+    kubeStateMetrics: true
+    network: true
+    node: true
+    prometheus: true
+    prometheusOperator: true
+
+# Global labels
+commonLabels:
+  environment: production
+  managed-by: helm
+  chart: kube-prometheus-stack
+  app.kubernetes.io/version: "60.0.0"
+

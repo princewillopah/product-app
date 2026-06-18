@@ -1,0 +1,196 @@
+name: Build & Push Images to Docker Hub
+
+# Triggers
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'images/**'
+      - '.github/workflows/build-images.yml'
+      # NOTE: 'k8s/**' is deliberately NOT a trigger. CI writes image tags back
+      # into k8s/, and triggering on k8s/** would make the pipeline retrigger
+      # itself forever. Manifest-only edits should not rebuild images anyway.
+  workflow_dispatch:  # Manual trigger
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
+  IMAGE_PREFIX: product-app-
+
+jobs:
+  build-matrix:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - order-service
+          - analytics-service
+          - product-service
+          - api-gateway
+    permissions:
+      contents: read
+
+    steps:
+      # 1. Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for git-describe
+
+      # 2. Set up Docker Buildx for multi-platform builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Log in to Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 4. Extract metadata (tags, labels)
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ env.IMAGE_PREFIX }}${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+          # Output tags:
+          # - docker.io/namespace/product-app-order-service:main
+          # - docker.io/namespace/product-app-order-service:main-abc123
+          # - docker.io/namespace/product-app-order-service:abc123
+          # - docker.io/namespace/product-app-order-service:latest (on main branch)
+
+      # 5. Build and push Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./images/${{ matrix.service }}
+          file: ./images/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Metadata labels:
+          # - org.opencontainers.image.created
+          # - org.opencontainers.image.revision
+          # - org.opencontainers.image.version
+
+      # 6. Log image details
+      - name: Log image build success
+        run: |
+          echo "✅ Built and pushed: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ env.IMAGE_PREFIX }}${{ matrix.service }}"
+          echo "📦 Tags:"
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'
+
+  # ============================================================================
+  # Validation & Smoke Tests
+  # ============================================================================
+  validate:
+    name: Validate Kubernetes Manifests
+    runs-on: ubuntu-latest
+    needs: build-matrix
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Validate Kubernetes manifests with kubeval
+      - name: Validate Kubernetes manifests
+        uses: instrumenta/kubeval-action@master
+        with:
+          files: k8s/
+          strict: true
+          ignore_missing_schemas: false
+
+      - name: Lint YAML files
+        run: |
+          sudo apt-get install -y yamllint
+          yamllint -d '{extends: default, rules: {line-length: {max: 120}, comments: {min-spaces-from-content: 1}}}' k8s/**/*.yaml helm-values/**/*.yaml argocd-apps/**/*.yaml
+
+  # ============================================================================
+  # GitOps Write-Back: pin the new image tag in Git (pull model)
+  # ----------------------------------------------------------------------------
+  # Instead of pushing to the cluster (which would need cluster credentials in
+  # CI), we commit the freshly-built image's SHA tag into kustomization.yaml.
+  # ArgoCD watches Git and pulls the change on its own. CI never touches the
+  # cluster, tags are immutable, and rollback is just `git revert`.
+  # ============================================================================
+  update-manifests:
+    name: Write Image Tag Back to Git
+    runs-on: ubuntu-latest
+    needs: [build-matrix, validate]
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write   # lets the default GITHUB_TOKEN push the tag-bump commit
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}   # stay on the branch (not detached HEAD) so we can push
+
+      - name: Compute immutable image tag
+        id: tag
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"   # 7 chars == docker/metadata-action's sha tag
+
+      - name: Pin image tags in kustomization.yaml
+        run: |
+          sed -i "s|newTag:.*|newTag: ${{ steps.tag.outputs.sha }}|g" k8s/services/kustomization.yaml
+          echo "Pinned image tags:"
+          grep -E 'name:|newTag:' k8s/services/kustomization.yaml
+
+      - name: Commit & push tag bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- k8s/services/kustomization.yaml; then
+            echo "No tag change — nothing to commit."
+            exit 0
+          fi
+          git add k8s/services/kustomization.yaml
+          git commit -m "chore(deploy): pin images to ${{ steps.tag.outputs.sha }} [skip ci]"
+          git push   # GITHUB_TOKEN pushes do NOT retrigger workflows (extra loop guard)
+
+  # ============================================================================
+  # Summary
+  # ============================================================================
+  summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [build-matrix, validate, update-manifests]
+    if: always()
+
+    steps:
+      - name: Build Summary
+        run: |
+          echo "🎯 Build Summary"
+          echo "==============="
+          echo "Workflow: ${{ github.workflow }}"
+          echo "Event: ${{ github.event_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Author: ${{ github.actor }}"
+          echo ""
+          echo "📦 Images built:"
+          echo "  - order-service"
+          echo "  - analytics-service"
+          echo "  - product-service"
+          echo "  - api-gateway"
+          echo ""
+          echo "🔗 Registry: ${{ env.REGISTRY }}"
+          echo "📍 Namespace: ${{ env.IMAGE_NAMESPACE }}"
+          echo ""
+          echo "✅ All images pushed to Docker Hub"
+          echo "✅ Manifests validated"
+          echo "� Image tags written back to Git — ArgoCD will pull & deploy"
+

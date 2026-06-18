@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: product-app
+  namespace: argocd
+spec:
+  description: Product App multi-cluster deployments
+  sourceRepos:
+    - https://github.com/princewillopah/product-app.git
+  destinations:
+    - server: '*'
+      namespace: product-app
+    - server: '*'
+      namespace: observability-stack
+    - server: '*'
+      namespace: argocd
+  clusterResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'

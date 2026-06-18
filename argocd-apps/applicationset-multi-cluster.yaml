@@ -1,0 +1,138 @@
+---
+# ArgoCD ApplicationSet for Multi-Cluster Service Deployments
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: product-app-services-multi-cluster
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: product-app-services-appset
+spec:
+  goTemplate: true
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+
+  generators:
+    - list:
+        elements:
+          - cluster: dev
+            environment: development
+            url: https://kubernetes.default.svc   # this Kind cluster, where ArgoCD itself runs
+            namespace: product-app
+          # staging/prod are NOT registered clusters yet. Each block stays
+          # commented until you run `argocd cluster add <context>` for a real
+          # cluster; otherwise the ApplicationSet errors with "cluster not found".
+          # - cluster: staging
+          #   environment: staging
+          #   url: https://staging-cluster:6443
+          #   namespace: product-app
+          # - cluster: prod
+          #   environment: production
+          #   url: https://prod-cluster:6443
+          #   namespace: product-app
+
+  template:
+    metadata:
+      name: "product-app-services-{{ .cluster }}"
+      namespace: argocd
+      labels:
+        cluster: "{{ .cluster }}"
+        environment: "{{ .environment }}"
+        app.kubernetes.io/managed-by: argocd
+
+    spec:
+      project: product-app
+
+      source:
+        repoURL: git@github.com:princewillopah/product-app.git
+        targetRevision: main
+        path: k8s/services
+        kustomize:
+          nameSuffix: "-{{ .environment }}"
+          commonLabels:
+            environment: "{{ .environment }}"
+            cluster: "{{ .cluster }}"
+
+      destination:
+        server: "{{ .url }}"
+        namespace: "{{ .namespace }}"
+
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+
+---
+# ArgoCD ApplicationSet for Multi-Cluster Observability Deployments
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: product-app-observability-multi-cluster
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: product-app-observability-appset
+spec:
+  goTemplate: true
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+  generators:
+    - list:
+        elements:
+          - cluster: dev
+            environment: development
+            url: https://kubernetes.default.svc   # this Kind cluster, where ArgoCD itself runs
+            namespace: observability-stack
+          # staging/prod are NOT registered clusters yet. Each block stays
+          # commented until you run `argocd cluster add <context>` for a real
+          # cluster; otherwise the ApplicationSet errors with "cluster not found".
+          # - cluster: staging
+          #   environment: staging
+          #   url: https://staging-cluster:6443
+          #   namespace: observability-stack
+          # - cluster: prod
+          #   environment: production
+          #   url: https://prod-cluster:6443
+          #   namespace: observability-stack
+  template:
+    metadata:
+      name: "product-app-observability-{{ .cluster }}"
+      namespace: argocd
+      labels:
+        cluster: "{{ .cluster }}"
+        environment: "{{ .environment }}"
+        app.kubernetes.io/managed-by: argocd
+    spec:
+      project: product-app
+      source:
+        repoURL: git@github.com:princewillopah/product-app.git
+        targetRevision: main
+        path: k8s/observability
+        kustomize:
+          nameSuffix: "-{{ .environment }}"
+          commonLabels:
+            environment: "{{ .environment }}"
+            cluster: "{{ .cluster }}"
+      destination:
+        server: "{{ .url }}"
+        namespace: "{{ .namespace }}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+

@@ -1,0 +1,36 @@
+{{- if .Values.appServiceMonitors.enabled }}
+{{- $cfg := .Values.appServiceMonitors }}
+{{- range $svc := $cfg.services }}
+---
+# Tells the Prometheus Operator to scrape this app Service. The app Services
+# expose ONE port named "http" (8080); metrics are served at $svc.path on it.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $svc.name }}
+  namespace: {{ $cfg.namespace }}
+  labels:
+    app: {{ $svc.name }}
+    {{- include "observability.labels" $ | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $cfg.namespace }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $svc.name }}
+  endpoints:
+    - port: http                       # FIXED: app Services use port name "http"
+      path: {{ $svc.path }}
+      interval: {{ $cfg.interval }}
+      scrapeTimeout: {{ $cfg.scrapeTimeout }}
+      scheme: http
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: kubernetes_namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod_name
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+          targetLabel: service
+{{- end }}
+{{- end }}

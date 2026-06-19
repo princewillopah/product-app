@@ -1,0 +1,18 @@
+apiVersion: v2
+name: product-app
+description: >-
+  Product App microservices (order, product, analytics, api-gateway) with their
+  MongoDB and PostgreSQL datastores. Deployed via Helm/ArgoCD.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+dependencies:
+  - name: mongodb
+    version: "19.1.11"
+    repository: https://charts.bitnami.com/bitnami
+    condition: mongodb.enabled
+  - name: postgresql
+    version: "18.7.6"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled

@@ -44,14 +44,16 @@ spec:
       project: product-app
 
       source:
-        repoURL: git@github.com:princewillopah/product-app.git
+        repoURL: https://github.com/princewillopah/product-app.git
         targetRevision: main
-        path: k8s/services
-        kustomize:
-          nameSuffix: "-{{ .environment }}"
-          commonLabels:
-            environment: "{{ .environment }}"
-            cluster: "{{ .cluster }}"
+        path: charts/product-app
+        helm:
+          releaseName: product-app
+          valueFiles:
+            - values.yaml
+          # Per-environment overlays: when you register staging/prod clusters,
+          # add charts/product-app/values-<env>.yaml and append it to valueFiles
+          # (ArgoCD layers them in order, last file wins).
 
       destination:
         server: "{{ .url }}"
@@ -116,14 +118,16 @@ spec:
     spec:
       project: product-app
       source:
-        repoURL: git@github.com:princewillopah/product-app.git
+        repoURL: https://github.com/princewillopah/product-app.git
         targetRevision: main
-        path: k8s/observability
-        kustomize:
-          nameSuffix: "-{{ .environment }}"
-          commonLabels:
-            environment: "{{ .environment }}"
-            cluster: "{{ .cluster }}"
+        path: charts/observability
+        helm:
+          releaseName: observability
+          valueFiles:
+            - values.yaml
+          # Per-environment overlays: when you register staging/prod clusters,
+          # add charts/observability/values-<env>.yaml and append it to valueFiles
+          # (ArgoCD layers them in order, last file wins).
       destination:
         server: "{{ .url }}"
         namespace: "{{ .namespace }}"
@@ -135,4 +139,14 @@ spec:
         syncOptions:
           - CreateNamespace=true
           - PruneLast=true
+          # kube-prometheus-stack ships CRDs (prometheuses/alertmanagers) whose
+          # schema exceeds the 262KB client-side-apply annotation limit. Without
+          # server-side apply the sync fails: "metadata.annotations: Too long".
+          - ServerSideApply=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
 

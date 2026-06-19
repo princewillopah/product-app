@@ -1,0 +1,43 @@
+apiVersion: v2
+name: observability
+description: >-
+  Production-pattern observability stack for product-app: metrics (Prometheus),
+  logs (Loki), traces (Tempo), collection (OpenTelemetry Collector) and
+  visualization + correlation (Grafana). Single-instance topology sized for
+  small clusters; scale up via values (object storage, HA) without changing
+  concepts. Deployed via Helm/ArgoCD.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+# ----------------------------------------------------------------------------
+# Subcharts (the four pillars). Versions pinned to the latest resolved on
+# 2026-06-19. Toggle any component with its `*.enabled` value.
+# ----------------------------------------------------------------------------
+dependencies:
+  # Metrics: Prometheus Operator + Prometheus + Alertmanager + Grafana +
+  # node-exporter + kube-state-metrics (the whole metrics control plane).
+  - name: kube-prometheus-stack
+    version: "86.3.1"
+    repository: https://prometheus-community.github.io/helm-charts
+    condition: kube-prometheus-stack.enabled
+
+  # Logs: Loki in SingleBinary mode (filesystem backend at this scale).
+  - name: loki
+    version: "7.0.0"
+    repository: https://grafana.github.io/helm-charts
+    condition: loki.enabled
+
+  # Traces: Tempo single-binary (filesystem backend), with the metrics
+  # generator producing span-metrics + service-graph into Prometheus.
+  - name: tempo
+    version: "1.24.4"
+    repository: https://grafana.github.io/helm-charts
+    condition: tempo.enabled
+
+  # Collection: OpenTelemetry Collector (DaemonSet) — receives OTLP from apps
+  # (traces/logs) and tails container stdout into Loki via the logs preset.
+  - name: opentelemetry-collector
+    version: "0.158.2"
+    repository: https://open-telemetry.github.io/opentelemetry-helm-charts
+    condition: opentelemetry-collector.enabled

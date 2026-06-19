@@ -1,0 +1,130 @@
+{{- if .Values.prometheusRules.enabled }}
+---
+# Alerting + SLO rules reconciled into Prometheus by the Operator.
+# Metric names assume RED-style app metrics (http_requests_total,
+# http_request_duration_seconds_bucket). Tune expressions to your exposed
+# metrics — verify in Prometheus -> Graph before relying on them.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: product-app-alerts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: product-app
+    {{- include "observability.labels" . | nindent 4 }}
+spec:
+  groups:
+    # ------------------------------------------------------------------
+    # Service health (the golden signals: availability, errors, latency)
+    # ------------------------------------------------------------------
+    - name: service-health
+      interval: 30s
+      rules:
+        - alert: ServiceDown
+          expr: up{job=~"order-service|analytics-service|product-service|api-gateway"} == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "{{`{{ $labels.job }}`}} is DOWN"
+            description: "{{`{{ $labels.job }}`}} has had no healthy scrape target for 1m."
+
+        - alert: HighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+              /
+              sum(rate(http_requests_total[5m])) by (job)
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "{{`{{ $labels.job }}`}} 5xx error rate > 5%"
+            description: '{{`{{ $labels.job }}`}} error ratio is {{`{{ printf "%.2f" $value }}`}} over 5m.'
+
+        - alert: HighLatencyP95
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job)
+            ) > 1
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "{{`{{ $labels.job }}`}} P95 latency > 1s"
+            description: '{{`{{ $labels.job }}`}} P95 latency is {{`{{ printf "%.2f" $value }}`}}s over 5m.'
+
+    # ------------------------------------------------------------------
+    # SLO burn-rate (multi-window) against a 99.9% availability target
+    # ------------------------------------------------------------------
+    - name: slo-burn-rate
+      interval: 30s
+      rules:
+        - alert: SLOErrorBurnRateFast
+          expr: |
+            (
+              sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+              /
+              (0.001 * sum(rate(http_requests_total[5m])) by (job))
+            ) > 14.4
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            window: "5m"
+          annotations:
+            summary: "Fast SLO burn ({{`{{ $labels.job }}`}})"
+            description: 'Burning the 30d error budget ~14.4x (current {{`{{ printf "%.1f" $value }}`}}x).'
+
+        - alert: SLOErrorBurnRateSlow
+          expr: |
+            (
+              sum(rate(http_requests_total{status=~"5.."}[1h])) by (job)
+              /
+              (0.001 * sum(rate(http_requests_total[1h])) by (job))
+            ) > 6
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            window: "1h"
+          annotations:
+            summary: "Slow SLO burn ({{`{{ $labels.job }}`}})"
+            description: 'Sustained error-budget burn ~6x (current {{`{{ printf "%.1f" $value }}`}}x).'
+
+    # ------------------------------------------------------------------
+    # Infrastructure (resource saturation)
+    # ------------------------------------------------------------------
+    - name: infrastructure
+      interval: 30s
+      rules:
+        - alert: PodHighMemory
+          expr: |
+            (
+              sum(container_memory_working_set_bytes{namespace="product-app", container!=""}) by (pod)
+              /
+              sum(kube_pod_container_resource_limits{namespace="product-app", resource="memory"}) by (pod)
+            ) > 0.85
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Pod {{`{{ $labels.pod }}`}} memory > 85% of limit"
+            description: 'Working set is {{`{{ $value | humanizePercentage }}`}} of the memory limit.'
+
+        - alert: PodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="product-app"}[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Pod {{`{{ $labels.pod }}`}} is crash-looping"
+            description: "More than 3 container restarts in 15m."
+{{- end }}

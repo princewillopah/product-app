@@ -1,0 +1,26 @@
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled | default true }}
+{{- with $svc.service }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Values.global.namespace }}
+  labels:
+    {{- include "product-app.labels" (dict "ctx" $ "name" $name) | nindent 4 }}
+  {{- with $svc.metrics }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: {{ .path | quote }}
+    prometheus.io/port: "8080"
+  {{- end }}
+spec:
+  type: {{ .type | default "ClusterIP" }}
+  selector:
+    {{- include "product-app.selectorLabels" (dict "name" $name) | nindent 4 }}
+  ports:
+    {{- toYaml .ports | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

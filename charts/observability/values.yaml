@@ -1,0 +1,484 @@
+# ============================================================================
+# observability — values
+# ----------------------------------------------------------------------------
+# Four pillars, one release:
+#   metrics  -> kube-prometheus-stack (Prometheus + Alertmanager + Grafana
+#               + node-exporter + kube-state-metrics + Operator)
+#   logs     -> Loki (SingleBinary, filesystem)
+#   traces   -> Tempo (single-binary, filesystem) + metrics-generator
+#   collect  -> OpenTelemetry Collector (DaemonSet)
+#
+# Data flow:
+#   apps --/metrics (scrape)--------------------> Prometheus      (PULL)
+#   apps --OTLP traces--> OTel Collector -------> Tempo           (PUSH)
+#   apps --stdout logs--> OTel filelog ---------> Loki            (PUSH)
+#   Tempo --span/service-graph metrics---------> Prometheus (remote-write)
+#   Grafana <- Prometheus + Loki + Tempo (correlated by stable datasource UIDs)
+#
+# Topology is single-instance (correct for <20 services / <10 nodes). To scale:
+# flip Loki/Tempo to distributed + object storage and raise replicas — the
+# concepts and dashboards stay identical.
+# ============================================================================
+
+# ============================================================================
+# METRICS — kube-prometheus-stack
+# ============================================================================
+kube-prometheus-stack:
+  enabled: true
+  # Fixed prefix so the Prometheus Service resolves predictably as
+  # "kube-prometheus-stack-prometheus" (referenced by Tempo + Grafana below).
+  fullnameOverride: kube-prometheus-stack
+
+  # --- Prometheus Operator ---
+  prometheusOperator:
+    resources:
+      requests: { cpu: 50m, memory: 100Mi }
+      limits: { cpu: 200m, memory: 256Mi }
+
+  # --- Prometheus server ---
+  prometheus:
+    service:
+      type: NodePort
+      nodePort: 30090          # kind maps host 9090 -> nodePort 30090
+    prometheusSpec:
+      # Discover ServiceMonitors / PodMonitors / Rules in ALL namespaces
+      # regardless of labels (simplest model while learning).
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+      probeSelectorNilUsesHelmValues: false
+      # Accept remote-write (Tempo's metrics-generator pushes span metrics here).
+      enableRemoteWriteReceiver: true
+      retention: 15d
+      scrapeInterval: 30s
+      evaluationInterval: 30s
+      externalLabels:
+        cluster: product-app-dev
+        environment: dev
+      resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        limits: { cpu: "1", memory: 1536Mi }
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: standard   # kind local-path
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 10Gi
+
+  # --- Alertmanager ---
+  alertmanager:
+    service:
+      type: NodePort
+      nodePort: 30093          # kind maps host 9093 -> nodePort 30093
+    alertmanagerSpec:
+      resources:
+        requests: { cpu: 25m, memory: 64Mi }
+        limits: { cpu: 100m, memory: 128Mi }
+      storage:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: standard
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 2Gi
+    # Greenfield: no external receivers yet. Alerts are routed to a blackhole
+    # ("null") so Alertmanager is valid and silent. Plug Slack/PagerDuty in by
+    # replacing the 'null' receivers below (see TODO markers).
+    config:
+      route:
+        group_by: ["alertname", "job", "severity"]
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+        receiver: "null"
+        routes:
+          - matchers: ['severity = "critical"']
+            receiver: "null"      # TODO: create + reference a 'pagerduty' receiver
+          - matchers: ['severity = "warning"']
+            receiver: "null"      # TODO: create + reference a 'slack' receiver
+      receivers:
+        - name: "null"
+        # TODO (prod): add real receivers, e.g.
+        # - name: "slack"
+        #   slack_configs:
+        #     - api_url: <from secret>
+        #       channel: "#alerts"
+      inhibit_rules:
+        # A firing critical mutes the matching warning (same alert/job).
+        - source_matchers: ['severity = "critical"']
+          target_matchers: ['severity = "warning"']
+          equal: ["alertname", "job"]
+
+  # --- node-exporter / kube-state-metrics (host + k8s object metrics) ---
+  nodeExporter:
+    enabled: true
+  kubeStateMetrics:
+    enabled: true
+  prometheus-node-exporter:
+    resources:
+      requests: { cpu: 50m, memory: 32Mi }
+      limits: { cpu: 200m, memory: 64Mi }
+
+  # kind doesn't expose these control-plane endpoints the way a kubeadm/cloud
+  # cluster does; disable their scrape jobs to avoid permanently-red targets.
+  kubeControllerManager:
+    enabled: false
+  kubeScheduler:
+    enabled: false
+  kubeProxy:
+    enabled: false
+  kubeEtcd:
+    enabled: false
+
+  # --- Grafana (visualization + correlation) ---
+  grafana:
+    enabled: true
+    # Default admin password is "admin"? No — kube-prometheus-stack sets it to
+    # "prom-operator". Retrieve with:
+    #   kubectl -n observability-stack get secret kube-prometheus-stack-grafana \
+    #     -o jsonpath='{.data.admin-password}' | base64 -d
+    # PROD: replace with admin.existingSecret pointing at a managed secret.
+    adminPassword: prom-operator
+
+    service:
+      type: NodePort
+      nodePort: 30300          # kind maps host 3000 -> nodePort 30300
+
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+
+    persistence:
+      enabled: true
+      storageClassName: standard
+      size: 2Gi
+
+    # Keep the stack's bundled cluster/node/workload dashboards.
+    defaultDashboardsEnabled: true
+
+    # Turn OFF the stack's auto Prometheus datasource so we can define all three
+    # datasources ourselves with STABLE uids — correlation links reference these
+    # uids, so they must be deterministic.
+    sidecar:
+      datasources:
+        defaultDatasourceEnabled: false
+      dashboards:
+        enabled: true
+
+    additionalDataSources:
+      # ---- Metrics ----
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://kube-prometheus-stack-prometheus:9090
+        isDefault: true
+        jsonData:
+          timeInterval: 30s
+          # Lets Grafana show an "exemplar -> trace" jump from metrics graphs.
+          exemplarTraceIdDestinations:
+            - name: trace_id
+              datasourceUid: tempo
+
+      # ---- Logs ----
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki:3100
+        jsonData:
+          # Extract a trace id out of a log line and offer a jump to Tempo.
+          # NOTE: depends on apps logging a trace id; tune the regex to match
+          # your log format (verify in Explore). This is the trace<-log link.
+          derivedFields:
+            - name: TraceID
+              matcherType: regex
+              matcherRegex: '"trace_id":"(\w+)"'
+              url: "$${__value.raw}"
+              datasourceUid: tempo
+              urlDisplayLabel: "View Trace"
+
+      # ---- Traces ----
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        access: proxy
+        url: http://tempo:3100
+        jsonData:
+          # trace -> logs (Tempo span -> Loki query for that service/trace)
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: "-1h"
+            spanEndTimeShift: "1h"
+            filterByTraceID: true
+            filterBySpanID: false
+            tags:
+              - key: service.name
+                value: service_name
+          # trace -> metrics (Tempo span -> Prometheus RED metrics)
+          tracesToMetrics:
+            datasourceUid: prometheus
+            spanStartTimeShift: "-1h"
+            spanEndTimeShift: "1h"
+            tags:
+              - key: service.name
+                value: service
+          # Service graph + node graph are powered by Tempo's metrics-generator
+          # writing span/service-graph metrics into Prometheus (configured below).
+          serviceMap:
+            datasourceUid: prometheus
+          nodeGraph:
+            enabled: true
+
+    # A couple of high-value community dashboards (downloaded by id at startup).
+    dashboardProviders:
+      dashboardproviders.yaml:
+        apiVersion: 1
+        providers:
+          - name: extra
+            orgId: 1
+            folder: "Extra"
+            type: file
+            disableDeletion: false
+            editable: true
+            options:
+              path: /var/lib/grafana/dashboards/extra
+    dashboards:
+      extra:
+        node-exporter-full:
+          gnetId: 1860
+          revision: 37
+          datasource: Prometheus
+        loki-logs:
+          gnetId: 13639
+          revision: 2
+          datasource: Loki
+
+# ============================================================================
+# LOGS — Loki (SingleBinary, filesystem)
+# ============================================================================
+loki:
+  enabled: true
+  fullnameOverride: loki         # -> Service "loki" on :3100
+
+  deploymentMode: SingleBinary
+
+  loki:
+    auth_enabled: false          # single-tenant (dev). PROD: enable + gateway.
+    commonConfig:
+      replication_factor: 1
+    schemaConfig:
+      configs:
+        - from: "2024-04-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: loki_index_
+            period: 24h
+    storage:
+      type: filesystem
+    limits_config:
+      retention_period: 360h     # 15 days, matches Prometheus
+      allow_structured_metadata: true
+      volume_enabled: true
+    # Loki 3.x ingests OTLP natively at /otlp/v1/logs (the Collector targets it).
+
+  singleBinary:
+    replicas: 1
+    persistence:
+      enabled: true
+      storageClass: standard
+      size: 5Gi
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+
+  # Disable distributed-mode components (not used in SingleBinary).
+  read:
+    replicas: 0
+  write:
+    replicas: 0
+  backend:
+    replicas: 0
+
+  # The default memcached caches request ~9Gi each — far too big for kind.
+  chunksCache:
+    enabled: false
+  resultsCache:
+    enabled: false
+
+  # nginx gateway not needed; apps/Grafana hit the loki Service directly.
+  gateway:
+    enabled: false
+  # No object storage backend, so no bundled MinIO.
+  minio:
+    enabled: false
+  # Keep self-monitoring/test off to stay lean.
+  lokiCanary:
+    enabled: false
+  test:
+    enabled: false
+  monitoring:
+    dashboards: { enabled: false }
+    rules: { enabled: false }
+    serviceMonitor: { enabled: false }
+    selfMonitoring: { enabled: false }
+
+# ============================================================================
+# TRACES — Tempo (single-binary, filesystem) + metrics-generator
+# ============================================================================
+tempo:
+  enabled: true
+  fullnameOverride: tempo        # -> Service "tempo"
+
+  persistence:
+    enabled: true
+    storageClassName: standard
+    size: 5Gi
+
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+  tempo:
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /var/tempo/traces
+    # Accept OTLP from the Collector on the standard ports.
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    # metrics-generator turns spans into RED metrics + a service graph and
+    # remote-writes them to Prometheus. This powers Grafana's service map and
+    # trace->metrics links WITHOUT any app changes.
+    metricsGenerator:
+      enabled: true
+      remoteWriteUrl: "http://kube-prometheus-stack-prometheus:9090/api/v1/write"
+
+    # Enabling the generator is not enough: each tenant must opt its spans into
+    # the processors. Without this, the generator runs but emits ZERO series.
+    overrides:
+      defaults:
+        metrics_generator:
+          processors:
+            - service-graphs   # produces traces_service_graph_* (the node graph)
+            - span-metrics     # produces traces_spanmetrics_* (RED metrics)
+
+  serviceMonitor:
+    enabled: false
+
+# ============================================================================
+# COLLECT — OpenTelemetry Collector (DaemonSet)
+# ============================================================================
+opentelemetry-collector:
+  enabled: true
+  fullnameOverride: otel-collector   # -> Service "otel-collector" (apps target :4317)
+
+  mode: daemonset
+
+  # In daemonset mode the chart does NOT create a ClusterIP Service unless we
+  # ask for one. The apps push OTLP traces to "otel-collector:4317", so we need
+  # a stable Service in front of the per-node agents. (Logs are still tailed
+  # node-locally by the filelog receiver, not via this Service.)
+  service:
+    enabled: true
+    type: ClusterIP
+
+  # contrib image carries the extra receivers/processors/exporters we use.
+  image:
+    repository: otel/opentelemetry-collector-contrib
+  command:
+    name: otelcol-contrib            # MUST match the contrib binary name
+
+  resources:
+    requests: { cpu: 100m, memory: 192Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+  # Presets do the boilerplate:
+  #   logsCollection      -> adds a `filelog` receiver tailing /var/log/pods
+  #                          (+ the hostPath mounts) so container stdout -> Loki
+  #   kubernetesAttributes-> adds `k8sattributes` processor (+ RBAC) to enrich
+  #                          telemetry with pod/namespace/node metadata
+  presets:
+    logsCollection:
+      enabled: true
+      includeCollectorLogs: false
+    kubernetesAttributes:
+      enabled: true
+
+  # Full pipeline (this is the teaching artifact — read top to bottom).
+  # NOTE: filelog (receiver) and k8sattributes (processor) come from the presets
+  # above; we reference them in the pipelines so the merge keeps them.
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch:
+        send_batch_size: 1024
+        timeout: 10s
+    exporters:
+      # traces -> Tempo
+      otlp/tempo:
+        endpoint: tempo:4317
+        tls:
+          insecure: true
+      # logs -> Loki native OTLP endpoint
+      otlphttp/loki:
+        endpoint: http://loki:3100/otlp
+      # console echo for debugging (set verbosity: detailed to inspect payloads)
+      debug:
+        verbosity: basic
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, batch]
+          exporters: [otlp/tempo, debug]
+        logs:
+          receivers: [otlp, filelog]
+          processors: [memory_limiter, k8sattributes, batch]
+          exporters: [otlphttp/loki, debug]
+
+# ============================================================================
+# LOCAL TEMPLATES (this chart) — see templates/
+# ============================================================================
+
+# ServiceMonitors for the app services. The app Services expose a single port
+# named "http" (8080); metrics live at per-service paths below.
+appServiceMonitors:
+  enabled: true
+  namespace: product-app          # where the app Services live
+  interval: 30s
+  scrapeTimeout: 10s
+  services:
+    - name: order-service
+      path: /metrics
+    - name: api-gateway
+      path: /metrics
+    - name: analytics-service
+      path: /metrics
+    - name: product-service
+      path: /actuator/prometheus
+
+# PrometheusRule (alerting/SLO rules) shipped by this chart.
+prometheusRules:
+  enabled: true

@@ -1,0 +1,25 @@
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled | default true }}
+{{- with $svc.pdb }}
+{{- if .enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Values.global.namespace }}
+  labels:
+    {{- include "product-app.labels" (dict "ctx" $ "name" $name) | nindent 4 }}
+spec:
+  {{- if hasKey . "minAvailable" }}
+  minAvailable: {{ .minAvailable }}
+  {{- else if hasKey . "maxUnavailable" }}
+  maxUnavailable: {{ .maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "product-app.selectorLabels" (dict "name" $name) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

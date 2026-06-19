@@ -1,0 +1,16 @@
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled | default true }}
+{{- with $svc.configMap }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ $.Values.global.namespace }}
+  labels:
+    {{- include "product-app.labels" (dict "ctx" $ "name" $name) | nindent 4 }}
+data:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- end }}

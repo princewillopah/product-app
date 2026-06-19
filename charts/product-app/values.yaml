@@ -1,0 +1,513 @@
+# ============================================================================
+# product-app — application services + datastores
+# ----------------------------------------------------------------------------
+# Each entry under `services` is rendered by the generic templates in
+# templates/ (deployment, service, hpa, pdb, serviceaccount, rbac, configmap).
+# Complex fields (env, ports, probes, volumes, ...) are passed through verbatim
+# with toYaml, so a service can be as simple or as detailed as it needs.
+# ============================================================================
+
+global:
+  # All app resources land in this namespace. Inter-service DNS names below
+  # (e.g. order-service.product-app) must agree with this value.
+  namespace: product-app
+  image:
+    registry: docker.io
+    repository: princewillopah
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# Default RBAC granted to every service ServiceAccount (overridable per service).
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["configmaps"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: [""]
+      resources: ["secrets"]
+      verbs: ["get"]
+
+# Common pod annotations for Prometheus pod-scrape discovery (per-service path).
+commonPodAnnotations:
+  prometheus.io/scrape: "true"
+
+services:
+  # ==========================================================================
+  # api-gateway (Node.js) — public entrypoint, no datastore
+  # ==========================================================================
+  api-gateway:
+    image: product-app-api-gateway
+    replicas: 2
+    podLabels:
+      version: v1
+      monitoring: "true"
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/metrics"
+    ports:
+      - name: http
+        containerPort: 8080
+        protocol: TCP
+    service:
+      type: NodePort          # exposed on the host via kind port-map 30000 -> 8000
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+          nodePort: 30000
+          protocol: TCP
+    env:
+      - name: PORT
+        value: "8080"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: "http://otel-collector.observability-stack:4317"
+      - name: OTEL_SERVICE_NAME
+        value: "api-gateway"
+      - name: ORDER_SERVICE_URL
+        value: "http://order-service.product-app:8080"
+      - name: PRODUCT_SERVICE_URL
+        value: "http://product-service.product-app:8080"
+      - name: ANALYTICS_SERVICE_URL
+        value: "http://analytics-service.product-app:8080"
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 10
+      periodSeconds: 5
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 10
+    resources:
+      requests:
+        cpu: 150m
+        memory: 192Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 80
+    pdb:
+      enabled: true
+      minAvailable: 1
+    # ServiceMonitor scrape config consumed by the observability chart.
+    metrics:
+      path: /metrics
+      port: http
+
+  # ==========================================================================
+  # analytics-service (Python/FastAPI) — needs PostgreSQL
+  # Dockerfile CMD hardcodes uvicorn --port 8004, so we override the container
+  # command to listen on 8080 (uniform fleet port).
+  # ==========================================================================
+  analytics-service:
+    image: product-app-analytics-service
+    replicas: 2
+    podLabels:
+      version: v1
+      monitoring: "true"
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/metrics"
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - name: http
+        containerPort: 8080
+        protocol: TCP
+    service:
+      type: ClusterIP
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+          protocol: TCP
+    env:
+      - name: ENVIRONMENT
+        value: "production"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: "http://otel-collector.observability-stack:4317"
+      - name: OTEL_SERVICE_NAME
+        value: "analytics-service"
+      - name: OTEL_TRACES_EXPORTER
+        value: "otlp"
+      - name: OTEL_METRICS_EXPORTER
+        value: "prometheus"
+      - name: DATABASE_URL
+        value: "postgresql://postgres:postgres@postgres:5432/analytics_db"
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 10
+      periodSeconds: 5
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 10
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 80
+    pdb:
+      enabled: true
+      minAvailable: 1
+    metrics:
+      path: /metrics
+      port: http
+
+  # ==========================================================================
+  # product-service (Java/Spring Boot) — needs MongoDB
+  # application.yml sets server.port=8001; SERVER_PORT env overrides it to 8080.
+  # ==========================================================================
+  product-service:
+    image: product-app-product-service
+    replicas: 2
+    podLabels:
+      version: v1
+      monitoring: "true"
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/actuator/prometheus"
+    ports:
+      - name: http
+        containerPort: 8080
+        protocol: TCP
+    service:
+      type: ClusterIP
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+          protocol: TCP
+    env:
+      - name: SERVER_PORT
+        value: "8080"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: "http://otel-collector.observability-stack:4317"
+      - name: OTEL_SERVICE_NAME
+        value: "product-service"
+      - name: MONGO_URI
+        value: "mongodb://mongodb:27017/products_db"
+      - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
+        value: "health,metrics,prometheus"
+    readinessProbe:
+      httpGet:
+        path: /actuator/health
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 5
+    livenessProbe:
+      httpGet:
+        path: /actuator/health
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    resources:
+      requests:
+        cpu: 250m
+        memory: 384Mi
+      limits:
+        cpu: 750m
+        memory: 768Mi
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 80
+    pdb:
+      enabled: true
+      minAvailable: 1
+    metrics:
+      path: /actuator/prometheus
+      port: http
+
+  # ==========================================================================
+  # order-service (Go) — needs MongoDB. Hardened pod (non-root, RO rootfs).
+  # FIXES vs original manifest:
+  #   * PORT=8080 (app default was 8002)
+  #   * readiness path /health (app has NO /health/ready)
+  #   * single http:8080 port (app exposes /metrics on 8080, not 8888)
+  #   * removed dead DB_* env + missing db-credentials secret; use MONGO_URI
+  # ==========================================================================
+  order-service:
+    image: product-app-order-service
+    replicas: 2
+    labels:
+      version: v1
+      managed-by: argocd
+    podLabels:
+      version: v1
+      monitoring: "true"
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/metrics"
+      co.elastic.logs/enabled: "true"
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 0
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: [order-service]
+              topologyKey: kubernetes.io/hostname
+    ports:
+      - name: http
+        containerPort: 8080
+        protocol: TCP
+    service:
+      type: ClusterIP
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+          protocol: TCP
+    env:
+      - name: ENVIRONMENT
+        value: "production"
+      - name: LOG_LEVEL
+        value: "info"
+      - name: SERVICE_NAME
+        value: "order-service"
+      - name: PORT
+        value: "8080"
+      - name: SERVICE_VERSION
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.labels['version']
+      - name: POD_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+      - name: POD_NAMESPACE
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.namespace
+      - name: POD_IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
+      - name: OTEL_TRACES_EXPORTER
+        value: "otlp"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: "http://otel-collector.observability-stack:4317"
+      - name: OTEL_EXPORTER_OTLP_PROTOCOL
+        value: "grpc"
+      - name: OTEL_SERVICE_NAME
+        value: "order-service"
+      - name: MONGO_URI
+        value: "mongodb://mongodb:27017/orders_db"
+      - name: ANALYTICS_SERVICE_URL
+        value: "http://analytics-service.product-app:8080"
+      - name: PRODUCT_SERVICE_URL
+        value: "http://product-service.product-app:8080"
+    volumeMounts:
+      - name: config
+        mountPath: /etc/config
+        readOnly: true
+      - name: cache
+        mountPath: /tmp/cache
+    volumes:
+      - name: config
+        configMap:
+          name: order-service-config
+          defaultMode: 0444
+      - name: cache
+        emptyDir:
+          sizeLimit: 1Gi
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 3000
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 2
+    startupProbe:
+      httpGet:
+        path: /health
+        port: http
+      periodSeconds: 2
+      timeoutSeconds: 5
+      failureThreshold: 30
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    # Mounted at /etc/config (parity with original; app also reads these as env).
+    configMap:
+      ENVIRONMENT: "production"
+      LOG_LEVEL: "info"
+      LOG_FORMAT: "json"
+      TRACE_SAMPLE_RATE: "1.0"
+      METRICS_ENABLED: "true"
+      HEALTH_CHECK_TIMEOUT: "5s"
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: Utilization
+              averageUtilization: 80
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 15
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+            - type: Pods
+              value: 2
+              periodSeconds: 60
+          selectPolicy: Max
+    pdb:
+      enabled: true
+      minAvailable: 1
+    metrics:
+      path: /metrics
+      port: http
+
+# ============================================================================
+# Datastores (Bitnami subcharts). Dev-grade: no/weak auth, single replica.
+# NOTE: Post-2025 docker.io/bitnami keeps only `latest` tags; pinned version
+# tags live under docker.io/bitnamilegacy. If image pulls fail, set the image
+# repository to bitnamilegacy/* and global.security.allowInsecureImages=true.
+# ============================================================================
+mongodb:
+  enabled: true
+  fullnameOverride: mongodb        # -> Service name "mongodb"
+  architecture: standalone
+  auth:
+    enabled: false                 # apps connect with no credentials
+  persistence:
+    enabled: true
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+postgresql:
+  enabled: true
+  fullnameOverride: postgres       # -> primary Service name "postgres"
+  auth:
+    postgresPassword: postgres
+    database: analytics_db
+  primary:
+    persistence:
+      enabled: true
+      size: 2Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi

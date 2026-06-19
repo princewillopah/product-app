@@ -26,7 +26,7 @@ import { StatCard } from '../components/StatCard';
 import { Badge, statusTone } from '../components/Badge';
 import { Skeleton } from '../components/Feedback';
 import { useProducts, useOrders } from '../hooks/useApi';
-import { formatCurrency, formatNumber, shortId } from '../lib/format';
+import { formatCurrency, formatNumber, pluralize, shortId } from '../lib/format';
 
 const CATEGORY_COLORS = [
   '#6366f1',
@@ -113,7 +113,7 @@ export function Dashboard() {
             accent="brand"
             index={0}
             loading={loading}
-            sub={`${byCategory.length} categories`}
+            sub={pluralize(byCategory.length, 'category', 'categories')}
           />
           <StatCard
             label="Total Orders"
@@ -122,7 +122,7 @@ export function Dashboard() {
             accent="sky"
             index={1}
             loading={loading}
-            sub={`${byStatus.length} statuses`}
+            sub={pluralize(byStatus.length, 'status', 'statuses')}
           />
           <StatCard
             label="Total Revenue"

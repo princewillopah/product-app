@@ -26,6 +26,13 @@ export function initials(name: string): string {
   return parts.map((p) => p[0]?.toUpperCase() ?? '').join('') || '?';
 }
 
+// Returns "<count> <word>" with correct singular/plural, e.g. pluralize(1,
+// 'category', 'categories') -> "1 category". Falls back to appending 's'.
+export function pluralize(count: number, singular: string, plural?: string): string {
+  const word = count === 1 ? singular : plural ?? `${singular}s`;
+  return `${formatNumber(count)} ${word}`;
+}
+
 // Smoothly animates a number from its previous value to the next one. Used by
 // the dashboard stat cards so updates feel alive rather than snapping.
 export function useCountUp(target: number, duration = 700): number {

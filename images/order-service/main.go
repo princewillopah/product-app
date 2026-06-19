@@ -73,6 +73,13 @@ type CreateOrderRequest struct {
 	Quantity  int    `json:"quantity"`
 }
 
+// productInfo is the subset of the product-service payload we need to price an order.
+type productInfo struct {
+	ID    string  `json:"id"`
+	Name  string  `json:"name"`
+	Price float64 `json:"price"`
+}
+
 type ResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -193,6 +200,58 @@ func getAllOrders(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "]")
 }
 
+// productServiceBaseURL is where we look up product prices when creating an order.
+func productServiceBaseURL() string {
+	if v := strings.TrimSpace(os.Getenv("PRODUCT_SERVICE_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://product-service.product-app:8080"
+}
+
+// orderHTTPClient is reused for internal service-to-service calls.
+var orderHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+// fetchProduct retrieves a product (name + price) from product-service so an
+// order's total reflects the real catalog price instead of a hardcoded value.
+// The active trace context is propagated so the order->product hop shows up in
+// the distributed trace and service graph.
+func fetchProduct(ctx context.Context, productID string) (productInfo, error) {
+	ctx, span := tracer.Start(ctx, "fetchProduct")
+	defer span.End()
+	span.SetAttributes(attribute.String("product.id", productID))
+
+	var p productInfo
+	url := fmt.Sprintf("%s/api/products/%s", productServiceBaseURL(), productID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		span.RecordError(err)
+		return p, err
+	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+
+	resp, err := orderHTTPClient.Do(req)
+	if err != nil {
+		span.RecordError(err)
+		return p, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("product lookup returned status %d", resp.StatusCode)
+		span.SetStatus(codes.Error, err.Error())
+		return p, err
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		span.RecordError(err)
+		return p, err
+	}
+	if p.Price <= 0 {
+		return p, fmt.Errorf("product %s has no valid price", productID)
+	}
+	span.SetAttributes(attribute.Float64("product.price", p.Price))
+	return p, nil
+}
+
 func createOrder(w http.ResponseWriter, r *http.Request) {
 	l := getLogger(r)
 	l.Info("POST /api/orders")
@@ -217,13 +276,23 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 	order.CreatedAt = time.Now()
 	order.UpdatedAt = time.Now()
 	order.Status = "pending"
-	order.TotalPrice = float64(payload.Quantity) * 99.99
+
+	// Price the order from the real product catalog (not a hardcoded value) so
+	// totals, revenue, and average order value reflect reality.
+	product, err := fetchProduct(r.Context(), payload.ProductID)
+	if err != nil {
+		l.Error("Failed to price order from product-service",
+			zap.String("product_id", payload.ProductID), zap.Error(err))
+		http.Error(w, "could not price order: product not found or unavailable", http.StatusBadRequest)
+		return
+	}
+	order.TotalPrice = float64(payload.Quantity) * product.Price
 
 	collection := client.Database("orders_db").Collection("orders")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err := collection.InsertOne(ctx, order)
+	_, err = collection.InsertOne(ctx, order)
 	if err != nil {
 		l.Error("Failed to create order", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)

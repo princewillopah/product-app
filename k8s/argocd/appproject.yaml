@@ -14,6 +14,11 @@ spec:
       namespace: observability-stack
     - server: '*'
       namespace: argocd
+    # kube-prometheus-stack places control-plane scrape Services (kubelet,
+    # coredns) in kube-system. ArgoCD must be allowed to manage that namespace
+    # or the observability sync fails: "namespace kube-system is not permitted".
+    - server: '*'
+      namespace: kube-system
   clusterResourceWhitelist:
     - group: '*'
       kind: '*'

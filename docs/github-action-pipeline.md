@@ -1,41 +1,51 @@
+# The CI/CD Pipeline & GitOps — line by line
 
+This is a teaching walkthrough of how a `git push` becomes a running deployment.
+Two halves:
 
-**Your ArgoCD ApplicationSets point at clusters that don't exist yet.** Look at lines like `url: https://dev-cluster:6443` — those are placeholder hostnames. Right now ArgoCD only knows about the local cluster (`https://kubernetes.default.svc`). So even though the ApplicationSets are *installed*, they are not deploying anything because they can't reach `dev-cluster`, `staging-cluster`, or `prod-cluster`. I'll show you exactly where this matters and how to fix it at the end. [certain]
+1. **CI** — `.github/workflows/build-images.yml` builds images and writes the new
+   image tag back into Git.
+2. **CD (GitOps)** — ArgoCD watches Git and makes the cluster match it.
 
-Now the line-by-line teaching.
+The key property: **CI never talks to the cluster, and the cluster never holds
+registry push credentials.** Git is the hand-off point between them.
+
+```mermaid
+flowchart LR
+    A[git push to main] --> B[GitHub Actions]
+    B -->|build 5 images| C[(Docker Hub)]
+    B -->|yq writes tag into<br/>charts/product-app/values.yaml<br/>commit skip ci| D[(Git)]
+    D --> E[ArgoCD]
+    C --> E
+    E -->|helm sync| F[kind cluster]
+```
 
 ---
 
-# PART 1 — The Pipeline (GitHub Actions)
+# Part 1 — The pipeline (`build-images.yml`)
 
-File: build-images.yml
-
-A GitHub Actions pipeline is a YAML file that runs automation on GitHub's servers when something happens in your repo (like a `git push`). Let's walk it.
-
-## Header & triggers
-
-```yaml
-name: Build & Push Images to Docker Hub
-```
-Just a human-readable name shown in the GitHub "Actions" tab.
+## Triggers
 
 ```yaml
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - 'images/**'
       - '.github/workflows/build-images.yml'
-      - 'k8s/**'
+      # NOTE: 'charts/**' is deliberately NOT here.
   workflow_dispatch:
 ```
-- `on:` = "what events start this pipeline."
-- `push:` + `branches: [main]` = run only when commits land on the `main` branch.
-- `paths:` = an **optimization**. Only run if the push changed files under `images/`, the workflow file itself, or `k8s/`. If you only edit a README, the pipeline is skipped (saves build minutes).
-- `workflow_dispatch:` = adds a manual "Run workflow" button in the UI.
 
-## Environment variables
+- Runs only on `main`, and only when something under `images/**` or the workflow
+  file changes (editing a README won't burn build minutes).
+- **`charts/**` is intentionally excluded.** The pipeline *writes* to
+  `charts/product-app/values.yaml` at the end; if `charts/**` were a trigger, that
+  write would retrigger the pipeline forever. The tag-bump commit also carries
+  `[skip ci]` as a second guard.
+- `workflow_dispatch` adds a manual **Run workflow** button.
+
+## Environment
 
 ```yaml
 env:
@@ -43,25 +53,17 @@ env:
   IMAGE_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
   IMAGE_PREFIX: product-app-
 ```
-- `env:` = variables available to every job below.
-- `REGISTRY: docker.io` = Docker Hub's address.
-- `${{ secrets.DOCKERHUB_USERNAME }}` = pulls a value from **GitHub repo secrets** (Settings → Secrets → Actions). Secrets are encrypted; they never print in logs. This is why your username isn't hard-coded.
-- `IMAGE_PREFIX: product-app-` = the naming convention you asked for, so images become `product-app-order-service`, etc.
 
-The `${{ ... }}` syntax is GitHub Actions' expression/template language — anything inside gets substituted at runtime.
+Images are named `docker.io/<DOCKERHUB_USERNAME>/product-app-<service>`. The
+username comes from a **GitHub secret**, so nothing identity-specific is
+hard-coded. The registry is **Docker Hub** (not GHCR).
 
-## The build job
+## Job 1 — `build-matrix` (build & push)
 
 ```yaml
 jobs:
   build-matrix:
-    name: Build ${{ matrix.service }}
     runs-on: ubuntu-latest
-```
-- `jobs:` = a pipeline is made of one or more jobs. Jobs run in parallel by default.
-- `runs-on: ubuntu-latest` = GitHub spins up a fresh Ubuntu virtual machine for this job. It's thrown away when the job ends.
-
-```yaml
     strategy:
       fail-fast: false
       matrix:
@@ -70,353 +72,284 @@ jobs:
           - analytics-service
           - product-service
           - api-gateway
-```
-This is the **matrix** — the most important concept here. It tells GitHub: "run this job 4 times in parallel, once per value." So you get 4 simultaneous builds, one per service. `${{ matrix.service }}` becomes `order-service` in copy 1, `analytics-service` in copy 2, etc.
-
-- `fail-fast: false` = if `order-service` fails to build, **don't** cancel the other 3. Without this, one failure kills all siblings.
-
-```yaml
+          - frontend
     permissions:
       contents: read
 ```
-Least-privilege security: this job's GitHub token can only *read* the repo, nothing else.
 
-## The steps (run top-to-bottom inside each matrix copy)
+- The **matrix** runs this job once per service — **five** builds in parallel
+  (the `frontend` is included so the storefront/admin UI ships through CI like
+  everything else).
+- `fail-fast: false` — one service failing doesn't cancel the others.
+- `contents: read` — least privilege; this job only reads the repo.
 
-```yaml
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-```
-- `uses:` = run a pre-built, reusable action published by someone else. `actions/checkout@v4` is GitHub's official "git clone my repo onto this VM" action.
-- `fetch-depth: 0` = clone the **full** git history (default is just the latest commit). Needed if any tooling reads tags/commit history.
+The steps inside each parallel copy:
 
 ```yaml
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+- uses: actions/checkout@v4
+  with: { fetch-depth: 0 }
+- uses: docker/setup-buildx-action@v3
+- uses: docker/login-action@v3
+  with:
+    registry: ${{ env.REGISTRY }}
+    username: ${{ secrets.DOCKERHUB_USERNAME }}
+    password: ${{ secrets.DOCKERHUB_TOKEN }}
 ```
-Installs **Buildx**, Docker's advanced builder. It enables build caching and multi-platform builds (amd64 + arm64).
+
+- `checkout` clones the repo (full history; `fetch-depth: 0`).
+- `setup-buildx` enables BuildKit (layer caching, multi-platform).
+- `login-action` authenticates to Docker Hub. `DOCKERHUB_TOKEN` is a Docker Hub
+  **access token**, not your password. **If these two secrets are missing, this
+  is the step that fails and turns the run red.**
 
 ```yaml
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+- id: meta
+  uses: docker/metadata-action@v5
+  with:
+    images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ env.IMAGE_PREFIX }}${{ matrix.service }}
+    tags: |
+      type=ref,event=branch
+      type=sha,prefix={{branch}}-
+      type=sha,prefix=
+      type=raw,value=latest,enable={{is_default_branch}}
 ```
-Authenticates the VM to Docker Hub so it can push images. `DOCKERHUB_TOKEN` is an **access token** (not your real password) you generate at Docker Hub → Account Settings → Security. Both come from secrets.
+
+This computes the tag set for each image:
+
+| Recipe | Produces | Purpose |
+|--------|----------|---------|
+| `type=ref,event=branch` | `main` | human-friendly branch tag |
+| `type=sha,prefix={{branch}}-` | `main-abc1234` | branch + commit |
+| `type=sha,prefix=` | `abc1234` | **the immutable 7-char tag GitOps uses** |
+| `type=raw,value=latest` (main only) | `latest` | convenience |
+
+The bare `<sha>` tag is the important one — it's immutable, so a given tag always
+means exactly one image, which is what makes rollbacks reliable.
 
 ```yaml
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ env.IMAGE_PREFIX }}${{ matrix.service }}
-          tags: |
-            type=ref,event=branch
-            type=sha,prefix={{branch}}-
-            type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+- uses: docker/build-push-action@v5
+  with:
+    context: ./images/${{ matrix.service }}
+    file: ./images/${{ matrix.service }}/Dockerfile
+    push: true
+    tags: ${{ steps.meta.outputs.tags }}
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
 ```
-- `id: meta` = gives this step a name so later steps can read its outputs via `steps.meta.outputs....`
-- `images:` = the full image name, assembled from the env vars → `docker.io/<youruser>/product-app-order-service`.
-- `tags:` = a recipe for which tags to generate:
-  - `type=ref,event=branch` → tag = branch name (`main`)
-  - `type=sha,prefix={{branch}}-` → tag = `main-abc1234` (branch + commit SHA)
-  - `type=sha,prefix=` → tag = `abc1234` (just the commit SHA — this is the **immutable** one)
-  - `type=raw,value=latest,enable={{is_default_branch}}` → also tag `latest`, but only on `main`.
 
-The commit-SHA tag is what makes rollbacks reliable. `latest` is convenient but ambiguous (it moves), which is the warning I raised earlier.
+Builds from the service's own folder and pushes every computed tag. `type=gha`
+caches Docker layers in GitHub Actions cache so unchanged layers aren't rebuilt.
+
+## Job 2 — `validate` (lint the charts)
 
 ```yaml
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./images/${{ matrix.service }}
-          file: ./images/${{ matrix.service }}/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+validate:
+  needs: build-matrix
+  steps:
+    - uses: actions/checkout@v4
+    - uses: azure/setup-helm@v4
+      with: { version: v3.16.4 }
+    - run: |
+        for chart in charts/product-app charts/observability; do
+          helm lint "$chart"
+          helm template release "$chart" >/dev/null
+        done
+    - run: |
+        sudo apt-get update && sudo apt-get install -y yamllint
+        yamllint -d '{...}' argocd-apps/*.yaml k8s/argocd/appproject.yaml
 ```
-The actual build.
-- `context:` = the folder Docker builds from (the service's own directory).
--  = which Dockerfile to use.
-- `push: true` = after building, push to Docker Hub (vs. just building locally).
-- `tags:` / `labels:` = consume the output from the `meta` step.
-- `cache-from` / `cache-to: type=gha` = store/reuse Docker layer cache in **GitHub Actions cache**, so the next build reuses unchanged layers and runs much faster. `mode=max` caches all layers, not just the final ones.
+
+- `needs: build-matrix` — waits for all five builds.
+- **`helm lint`** catches chart mistakes; **`helm template … >/dev/null`** is a
+  render smoke test — if any template produces invalid YAML or a bad value
+  reference, this fails before anything reaches the cluster. Chart dependencies
+  are **vendored** (`charts/*/charts/*.tgz` committed to Git), so this runs fully
+  offline — no `helm repo add`, no network.
+- `yamllint` checks the ArgoCD manifests and the AppProject. (It deliberately
+  does **not** lint the Helm templates — those contain `{{ }}` and aren't valid
+  standalone YAML.)
+
+> This replaced an older `kubeval` step. `kubeval`'s action is archived and it
+> validated raw `k8s/` manifests that no longer exist now that everything is Helm.
+
+## Job 3 — `update-manifests` (the GitOps write-back)
+
+This is the heart of the pull-based model.
 
 ```yaml
-      - name: Log image build success
-        run: |
-          echo "✅ Built and pushed: ..."
+update-manifests:
+  needs: [build-matrix, validate]
+  if: github.ref == 'refs/heads/main'
+  permissions:
+    contents: write          # lets GITHUB_TOKEN push the tag-bump commit
+  steps:
+    - uses: actions/checkout@v4
+      with: { ref: ${{ github.ref_name }} }
+    - id: tag
+      run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+    - run: |
+        yq -i ".global.image.tag = \"${{ steps.tag.outputs.sha }}\"" charts/product-app/values.yaml
+    - run: |
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git diff --quiet -- charts/product-app/values.yaml && { echo "no change"; exit 0; }
+        git add charts/product-app/values.yaml
+        git commit -m "chore(deploy): release ${{ steps.tag.outputs.sha }} [skip ci]"
+        git push
 ```
-- `run:` = execute raw shell commands (instead of a reusable `uses:` action). The `|` lets you write multiple lines. Pure logging for humans.
 
-## The validate job
+- Runs only on `main`, only after builds + lint pass.
+- `contents: write` lets the built-in `GITHUB_TOKEN` push. (Pushes made with
+  `GITHUB_TOKEN` don't retrigger workflows — a second loop guard on top of
+  `[skip ci]` and the `paths` filter.)
+- `${GITHUB_SHA::7}` is the same 7-char short SHA `docker/metadata-action`
+  produced, so the tag written here exactly matches a pushed image.
+- **`yq`** sets `global.image.tag` in `charts/product-app/values.yaml` — the one
+  file ArgoCD reads. Because all five services inherit `global.image.tag` (no
+  per-service tag overrides), this single line version-bumps the whole app in
+  lockstep.
+- The commit lands in Git; ArgoCD takes it from here.
+
+> **Why write to Git instead of `kubectl set image`?** So CI needs **zero**
+> cluster credentials, the deployed version is auditable in Git history, and
+> rollback is just `git revert`.
+
+## Job 4 — `summary`
 
 ```yaml
-  validate:
-    name: Validate Kubernetes Manifests
-    runs-on: ubuntu-latest
-    needs: build-matrix
+summary:
+  needs: [build-matrix, validate, update-manifests]
+  if: always()
 ```
-- `needs: build-matrix` = **dependency**. This job waits until all 4 matrix builds succeed before starting. This is how you order jobs (otherwise they'd run in parallel).
 
-```yaml
-      - name: Validate Kubernetes manifests
-        uses: instrumenta/kubeval-action@master
-        with:
-          files: k8s/
-          strict: true
-```
-Runs `kubeval`, which checks your YAML in `k8s/` against the Kubernetes schema — catches typos like a misspelled `replicas` before they ever reach a cluster. `strict: true` rejects unknown fields (exactly the kind of bug we hit with `fsGroup` in the wrong place).
-
-```yaml
-      - name: Lint YAML files
-        run: |
-          sudo apt-get install -y yamllint
-          yamllint ... k8s/**/*.yaml ...
-```
-Installs and runs `yamllint` for style/formatting (indentation, line length). Catches sloppy YAML.
-
-## The argocd-sync job
-
-```yaml
-  argocd-sync:
-    needs: [build-matrix, validate]
-    if: github.ref == 'refs/heads/main'
-```
-- `needs: [build-matrix, validate]` = waits for **both** prior jobs.
-- `if:` = only run when the push is on `main`.
-
-```yaml
-        run: |
-          curl -sSL -o argocd https://.../argocd-linux-amd64
-          chmod +x argocd
-          ./argocd app sync --all \
-            --server "$ARGOCD_SERVER" \
-            --auth-token "$ARGOCD_TOKEN" \
-            --insecure
-        continue-on-error: true
-```
-Downloads the ArgoCD CLI and tells ArgoCD "new images exist, sync now." `continue-on-error: true` = if ArgoCD is unreachable, don't fail the whole pipeline.
-
-Note: this is **optional/push-based**. ArgoCD also polls Git on its own every ~3 minutes, so this step just makes syncs faster. It needs `ARGOCD_SERVER` and `ARGOCD_TOKEN` secrets, which you likely haven't set — that's fine, it's allowed to fail.
-
-## The summary job
-
-```yaml
-  summary:
-    needs: [build-matrix, validate]
-    if: always()
-```
-- `if: always()` = run even if earlier jobs failed, so you always get a summary. Pure reporting.
+`if: always()` runs it even if an earlier job failed, so you always get a result
+summary in the Actions tab.
 
 ---
 
-# PART 2 — ArgoCD (GitOps)
+# Part 2 — GitOps with ArgoCD
 
-**The core idea of GitOps:** instead of *you* running `kubectl apply`, ArgoCD runs **inside** the cluster, watches your Git repo, and continuously makes the cluster match what's in Git. Git becomes the single source of truth. You change Git → ArgoCD changes the cluster.
+**The idea:** instead of *you* running `kubectl`/`helm`, ArgoCD runs **inside**
+the cluster, watches this Git repo, and continuously makes the cluster match it.
+Change Git → ArgoCD changes the cluster. Three pieces.
 
-There are 3 files. Let me explain each.
+## A — AppProject (the guardrail)
 
-## File A — AppProject
+File: `k8s/argocd/appproject.yaml`
 
-File: appproject.yaml
+An `AppProject` answers "what are these apps allowed to do?" — it whitelists the
+source repo and the destination namespaces (`product-app`, `observability-stack`,
+`argocd`). An app in this project can't deploy from a random repo or into
+`kube-system`. It's a security boundary, not a deployment.
 
-An `AppProject` is a **security boundary / guardrail**. It answers: "what is this group of apps *allowed* to do?"
+## B — ApplicationSet (the factory)
 
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: AppProject
-metadata:
-  name: product-app
-  namespace: argocd
-```
-- `kind: AppProject` = a custom resource ArgoCD installed (this is why it failed earlier before ArgoCD was installed — the `kind` didn't exist yet).
-- Lives in the `argocd` namespace.
+File: `argocd-apps/applicationset-multi-cluster.yaml`
 
-```yaml
-spec:
-  description: Product App multi-cluster deployments
-  sourceRepos:
-    - https://github.com/princewillopah/product-app.git
-```
-- `sourceRepos:` = a whitelist of Git repos apps in this project may pull from. Only your repo is allowed. If someone tried to deploy from a random repo, ArgoCD blocks it.
-
-```yaml
-  destinations:
-    - server: '*'
-      namespace: product-app
-    - server: '*'
-      namespace: observability-stack
-    - server: '*'
-      namespace: argocd
-```
-- `destinations:` = where apps may deploy. `server: '*'` = any cluster; `namespace:` = but only into these 3 namespaces. So this project can never accidentally deploy into `kube-system`.
-
-```yaml
-  clusterResourceWhitelist:
-    - group: '*'
-      kind: '*'
-  namespaceResourceWhitelist:
-    - group: '*'
-      kind: '*'
-```
-- What **kinds** of Kubernetes objects are allowed. `'*'`/`'*'` = everything (Deployments, Services, ClusterRoles, etc.). In stricter setups you'd narrow this. For learning, wide-open is fine.
-
-## File B — ApplicationSet
-
-File: applicationset-multi-cluster.yaml
-
-An **Application** in ArgoCD = "deploy this Git path into this cluster/namespace." An **ApplicationSet** is a *factory* that generates many Applications from a template. You have 2 ApplicationSets (services + observability). I'll explain the first; the second is identical in structure.
-
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: ApplicationSet
-metadata:
-  name: product-app-services-multi-cluster
-  namespace: argocd
-```
-The factory object, named, living in `argocd`.
+An **Application** = "deploy this Git path into this cluster/namespace." An
+**ApplicationSet** is a factory that generates Applications from a list. There are
+two — one for services, one for observability.
 
 ```yaml
 spec:
   goTemplate: true
-  syncPolicy:
-    preserveResourcesOnDeletion: true
-```
-- `goTemplate: true` = use Go templating syntax `{{ .cluster }}` for substitution.
-- `preserveResourcesOnDeletion: true` = if you delete the ApplicationSet, **don't** wipe the deployed workloads. A safety net.
-
-```yaml
   generators:
     - list:
         elements:
           - cluster: dev
             environment: development
-            url: https://dev-cluster:6443
+            url: https://kubernetes.default.svc   # the kind cluster ArgoCD runs in
             namespace: product-app
-          - cluster: staging
-            ...
-          - cluster: prod
-            ...
+          # staging / prod are commented out until a real cluster is registered
+          # with `argocd cluster add`, otherwise sync errors "cluster not found".
 ```
-- `generators:` = "what data drives the factory." 
-- `list:` = the simplest generator: a hand-written list. Here, 3 entries (dev/staging/prod). The factory will produce **one Application per entry** → 3 Applications.
-- Each entry has variables (`cluster`, `environment`, `url`, `namespace`) that get plugged into the template below.
 
-**⚠️ This is the gap I flagged:** `url: https://dev-cluster:6443` is a placeholder. For ArgoCD to deploy to a cluster, that exact `url` must be a registered cluster (via `argocd cluster add`). None of these are real, so these 3 Applications can't sync.
+> Earlier versions used placeholder URLs like `https://dev-cluster:6443` that
+> pointed at clusters that didn't exist, so nothing deployed. That's fixed: `dev`
+> now targets `https://kubernetes.default.svc` (the local cluster), and the unreal
+> environments are commented out rather than left as broken placeholders.
 
 ```yaml
   template:
     metadata:
-      name: "product-app-services-{{ .cluster }}"
-      namespace: argocd
-      labels:
-        cluster: "{{ .cluster }}"
-        environment: "{{ .environment }}"
-```
-- `template:` = the blueprint for each generated Application. `{{ .cluster }}` is replaced per entry → produces `product-app-services-dev`, `product-app-services-staging`, `product-app-services-prod`.
-
-```yaml
+      name: "product-app-services-{{ .cluster }}"   # → product-app-services-dev
     spec:
       project: product-app
-```
-- Ties each generated Application back to the AppProject (File A) — inheriting its guardrails.
-
-```yaml
       source:
         repoURL: https://github.com/princewillopah/product-app.git
         targetRevision: main
-        path: k8s/services
-        kustomize:
-          nameSuffix: "-{{ .environment }}"
-          commonLabels:
-            environment: "{{ .environment }}"
-            cluster: "{{ .cluster }}"
-```
-- `source:` = **where the YAML lives in Git.**
-  - `repoURL` = your repo.
-  - `targetRevision: main` = track the `main` branch.
-  - `path: k8s/services` = deploy the manifests in that folder.
-  - `kustomize:` = apply Kustomize transformations. `nameSuffix: "-development"` renames resources, and `commonLabels` stamps env/cluster labels on everything. This lets one folder serve all 3 environments with different names/labels.
-
-```yaml
+        path: charts/product-app          # ← Helm chart, NOT a raw manifest folder
+        helm:
+          releaseName: product-app
+          valueFiles: [values.yaml]
       destination:
         server: "{{ .url }}"
         namespace: "{{ .namespace }}"
-```
-- `destination:` = **where in Kubernetes it goes** — the cluster `url` and `namespace` from the generator entry.
-
-```yaml
       syncPolicy:
-        automated:
-          prune: true
-          selfHeal: true
-          allowEmpty: false
+        automated: { prune: true, selfHeal: true, allowEmpty: false }
+        syncOptions: [CreateNamespace=true, PruneLast=true]
+        retry: { limit: 5, backoff: { duration: 5s, factor: 2, maxDuration: 3m } }
 ```
-This is the heart of GitOps automation:
-- `prune: true` = if you delete a resource from Git, ArgoCD deletes it from the cluster.
-- `selfHeal: true` = if someone manually `kubectl edit`s a live resource, ArgoCD reverts it back to match Git. The cluster can't drift.
-- `allowEmpty: false` = refuse to sync if it would result in zero resources (guards against accidentally wiping everything).
 
-```yaml
-        syncOptions:
-          - CreateNamespace=true
-          - PruneLast=true
-```
-- `CreateNamespace=true` = auto-create the target namespace if missing.
-- `PruneLast=true` = when pruning, delete old resources **after** applying new ones (safer ordering during updates).
+The important fields:
 
-```yaml
-        retry:
-          limit: 5
-          backoff:
-            duration: 5s
-            factor: 2
-            maxDuration: 3m
-```
-- If a sync fails, retry up to 5 times with **exponential backoff**: wait 5s, then 10s, then 20s... capped at 3 minutes. Handles transient failures (e.g., image not pushed yet).
+- **`path: charts/product-app` + `helm:`** — ArgoCD renders the Helm chart (this
+  is what reads the `global.image.tag` that CI wrote). The second ApplicationSet
+  is identical but with `path: charts/observability`,
+  `namespace: observability-stack`, and one extra sync option,
+  **`ServerSideApply=true`** (kube-prometheus-stack's CRDs exceed the client-side
+  apply annotation size limit, so server-side apply is required).
+- **`automated.prune`** — delete from the cluster what you delete from Git.
+- **`automated.selfHeal`** — revert manual `kubectl` drift back to Git. The
+  cluster cannot diverge from the repo.
+- **`allowEmpty: false`** — refuse to sync down to zero resources (anti-footgun).
+- **`CreateNamespace=true`** — ArgoCD creates `product-app` /
+  `observability-stack` itself, which is why there's no `namespaces.yaml`.
+- **`retry`** — exponential backoff handles transient cases (e.g. an image still
+  propagating in the registry).
 
-The **second ApplicationSet** (`product-app-observability-multi-cluster`) is the same pattern but with `path: k8s/observability` and `namespace: observability-stack`. It manages your monitoring stack via GitOps instead of your app services.
+This generates exactly two Applications today: `product-app-services-dev` and
+`product-app-observability-dev`.
 
-## File C — setup-argocd.sh
+## C — `setup-argocd.sh` (the installer)
 
-File: setup-argocd.sh — this isn't ArgoCD config, it's the **installer**: it Helm-installs ArgoCD itself, then `kubectl apply`s Files A and B. That's the script you ran that printed "✅ ArgoCD installed."
+File: `scripts/setup-argocd.sh`. Not config — the bootstrap. It Helm-installs
+ArgoCD into the `argocd` namespace, then `kubectl apply`s the AppProject (A) and
+the ApplicationSets (B). Because the repo is public, ArgoCD needs no Git
+credentials.
 
 ---
 
-# How they connect (the full loop)
+# The full loop
 
 ```mermaid
-flowchart LR
-    A[You: git push to main] --> B[GitHub Actions pipeline]
-    B --> C[Builds 4 images<br/>pushes to Docker Hub]
-    B --> D[Validates k8s manifests]
-    C --> E[ArgoCD watches Git repo]
+flowchart TD
+    A[git push to main] --> B[GitHub Actions]
+    B --> C[build 5 images → Docker Hub]
+    B --> D[helm lint + template]
+    C --> E[yq writes global.image.tag=sha<br/>commit skip ci, push]
     D --> E
-    E --> F[ApplicationSet generates<br/>Applications per cluster]
-    F --> G[ArgoCD applies manifests<br/>into target cluster/namespace]
-    G --> H[Pods pull images<br/>from Docker Hub]
+    E --> F[ArgoCD detects new commit]
+    F --> G[renders charts/product-app + charts/observability]
+    G --> H[syncs into product-app + observability-stack]
+    H --> I[pods pull :sha from Docker Hub]
 ```
 
-- The **pipeline** builds images (CI = Continuous Integration).
-- **ArgoCD** deploys them (CD = Continuous Delivery), driven by Git.
-- The **AppProject** is the guardrail; the **ApplicationSet** is the factory; the generated **Applications** are the actual deploy units.
+- **CI** = Continuous Integration: build + lint + write the tag.
+- **ArgoCD** = Continuous Delivery: detect + render + sync.
+- **AppProject** = guardrail · **ApplicationSet** = factory · generated
+  **Applications** = the actual deploy units.
 
 ---
 
-# The one thing to fix before this works end-to-end
+# Prerequisites for the loop to be green
 
-Your generator `url`s are fake. For your **local dev cluster**, the simplest correct value is the in-cluster address. You'd either:
+1. **GitHub secrets** `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` set — without
+   them the build job fails at Docker Hub login.
+2. **Docker Hub repos public** — `kind` has no pull secret, so private repos give
+   `ImagePullBackOff` after ArgoCD syncs.
+3. **CI has run once on `main`** so the `<sha>`-tagged images exist before ArgoCD
+   tries to pull them.
 
-1. Change the dev entry's `url` to `https://kubernetes.default.svc` (deploy ArgoCD into the same cluster it runs in), **or**
-2. Register real clusters with `argocd cluster add <context>` and use the URLs it reports.
-
-Want me to rewrite the ApplicationSet so the **dev** entry targets your current local cluster (so you can actually watch ArgoCD deploy something), while keeping staging/prod as clearly-marked placeholders? That would turn this from "installed but idle" into "actually deploying." [likely the most useful next step]
-
+With those in place, every push deploys itself. See [../HowTo.md](../HowTo.md) for
+the first-time setup and [RUNBOOK.md](RUNBOOK.md) for day-2 operations.

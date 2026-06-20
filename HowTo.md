@@ -1,218 +1,209 @@
+# HowTo — Bring product-app up from scratch
 
+This is the first-time setup guide. It takes you from an empty machine to a
+running cluster where pushing code auto-deploys through GitHub Actions + ArgoCD.
 
----
+**Mental model:** the cluster pulls images from Docker Hub, so CI must build and
+push them **before** ArgoCD can deploy. The order below respects that.
 
-## Step-by-Step Execution Guide
-
-**Your starting point:** Kind cluster `my-cluster` is running, 3 nodes, all namespaces clean.
-
----
-
-### STEP 1 — Understand the two blockers you must resolve first
-
-Before running anything, two values must be set for Docker Hub + GitHub:
-
-**a) Your Docker Hub username** — appears as `YOUR_DOCKERHUB_USERNAME` in image references.
-
-**b) Your GitHub PAT** — needed only for ArgoCD to connect to your Git repo.
-
-**c) Your Docker Hub access token** — needed by GitHub Actions to push images to Docker Hub.
-
-**Create your GitHub PAT now (for ArgoCD repo access):**
-1. Go to → https://github.com/settings/Developer Settings/tokens
-2. Click **"Generate new token (classic)"**
-3. Scopes: tick `repo`
-4. Copy the token — you'll need it in Step 6.
-
-**Create your Docker Hub access token now (for CI push):**
-1. Go to → https://hub.docker.com/settings/security
-2. Click New Access Token
-3. Permission: Read, Write, Delete
-4. Copy token — you'll add it as GitHub secret in Step 3.
-
----
-
-### STEP 2 — Replace `YOUR_DOCKERHUB_USERNAME` with your Docker Hub username
-
-Run this once, substituting your actual GitHub username:
-
-```bash
-cd /home/princewillopah/DevOps/product-app
-
-# Replace Docker Hub placeholder everywhere
-DOCKERHUB_USER="princewillopah"   # ← CHANGE THIS
-
-grep -rl "YOUR_DOCKERHUB_USERNAME" . | xargs sed -i "s|YOUR_DOCKERHUB_USERNAME|${DOCKERHUB_USER}|g"
-
-# Confirm it's replaced
-grep -r "YOUR_DOCKERHUB_USERNAME" . && echo "STILL HAS PLACEHOLDERS" || echo "✅ All replaced"
+```mermaid
+flowchart LR
+    A[1. Secrets] --> B[2. Public repos]
+    B --> C[3. Push → CI builds + writes tag]
+    C --> D[4. Create kind cluster]
+    D --> E[5. Install ArgoCD]
+    E --> F[6. Access UIs]
+    F --> G[7. Day-to-day: just push]
 ```
 
 ---
 
-### STEP 3 — Configure GitHub Actions secrets for Docker Hub push
+## Prerequisites
+
+Install and verify:
 
 ```bash
-# Go to your GitHub repo Settings > Secrets and variables > Actions
-# Add these secrets:
-# - DOCKERHUB_USERNAME=your_dockerhub_username
-# - DOCKERHUB_TOKEN=your_dockerhub_access_token
+docker --version          # container build/run
+kind version              # local Kubernetes
+kubectl version --client
+helm version
 ```
 
-For Docker Hub public images, Kubernetes imagePullSecret is not required.
+You also need a **GitHub** account (the repo) and a **Docker Hub** account (the
+registry). The repo `https://github.com/princewillopah/product-app.git` is
+**public**, so ArgoCD needs no Git credentials.
 
 ---
 
-### STEP 4 — Push your code to GitHub (so CI builds the images)
+## Step 1 — Add Docker Hub credentials to GitHub
 
-This is **required before deploying** because the deployments reference images from Docker Hub. Those images only exist if the GitHub Actions pipeline has run at least once.
+CI authenticates to Docker Hub with two **GitHub repository secrets** (encrypted;
+never printed in logs). Create a Docker Hub access token first:
 
-```bash
-# Create a new GitHub repo named: product-app
-# Go to: https://github.com/new
-# Name: product-app, Private or Public, no README
+1. Docker Hub → **Account Settings → Personal access tokens → Generate new token**.
+2. Name it `github-actions`, scope **Read & Write**, copy it (shown once).
 
-cd /home/princewillopah/DevOps/product-app
-git init
-git add .
-git commit -m "Initial production setup"
-git branch -M main
-git remote add origin https://github.com/princewillopah/product-app.git
-git push -u origin main
-```
+Then in GitHub → **Settings → Secrets and variables → Actions → New repository
+secret**, add:
 
-GitHub Actions will then automatically:
-- Build all 4 Docker images in parallel
-- Push them to `docker.io/princewillopah/order-service:latest` etc.
+| Secret | Value |
+|--------|-------|
+| `DOCKERHUB_USERNAME` | `princewillopah` |
+| `DOCKERHUB_TOKEN` | the access token from above (paste it directly into GitHub) |
 
-Watch it at: `https://github.com/princewillopah/product-app/actions`
-
-**Wait for the pipeline to go green before proceeding.**
+> Never paste the token into chat, a file, or a commit. It lives only in GitHub
+> secrets.
 
 ---
 
-### STEP 5 — Deploy the observability stack (Helm)
+## Step 2 — Make the Docker Hub repos public
 
-```bash
-cd /home/princewillopah/DevOps/product-app
+`kind` has no image-pull secret, so ArgoCD-synced pods can only pull from
+**public** repositories. On the first CI push the five repos are auto-created as
+**private** — flip each to public (Docker Hub → repo → Settings → Make public):
 
-bash scripts/deploy-all.sh --cluster dev
 ```
-
-This installs (in order):
-1. Namespaces (`observability-stack`, product-app, `argocd`)
-2. `kube-prometheus-stack` via Helm → Prometheus Operator + AlertManager + Grafana + node-exporter
-3. PrometheusRule CRDs (your SLO alert rules)
-4. ServiceMonitor CRDs (dynamic scrape config)
-5. OpenTelemetry Collector
-6. All 4 application services via `kubectl apply -k k8s/services`
-7. Waits for all rollouts to finish
-8. Starts port-forwards so you can access the UIs
-
-**Expected time: ~8–12 minutes** (Helm chart download + pod startup).
+product-app-order-service
+product-app-analytics-service
+product-app-product-service
+product-app-api-gateway
+product-app-frontend
+```
 
 ---
 
-### STEP 6 — Install ArgoCD and connect it to your Git repo
+## Step 3 — Push code so CI builds the images
 
 ```bash
 cd /home/princewillopah/DevOps/product-app
+git add -A
+git commit -m "ci: trigger image build"   # or push any change under images/**
+git push origin main
+```
 
+Watch it at `https://github.com/princewillopah/product-app/actions`. On a green
+run the pipeline:
+
+1. builds all **five** images in parallel and pushes them to Docker Hub with tags
+   `latest`, `main`, `main-<sha>`, and the immutable `<sha>`;
+2. runs `helm lint` + `helm template` on both charts and `yamllint` on the ArgoCD
+   manifests;
+3. writes the 7-char `<sha>` into `charts/product-app/values.yaml`
+   (`global.image.tag`) and commits it with `[skip ci]`.
+
+**Wait for the run to go green before continuing** — Step 5 deploys those exact
+image tags.
+
+> Until the secrets in Step 1 exist, this run fails at the Docker Hub login step.
+> That is the only manual gate in the whole system.
+
+---
+
+## Step 4 — Create the local kind cluster
+
+```bash
+bash scripts/setup-kind-dev.sh
+```
+
+This creates the 3-node `product-app-dev` cluster (1 control-plane + 2 workers),
+maps NodePorts to `localhost`, and installs `metrics-server` (needed for HPAs).
+
+---
+
+## Step 5 — Install ArgoCD and bootstrap GitOps
+
+```bash
 bash scripts/setup-argocd.sh
 ```
 
-This:
-1. Installs ArgoCD via Helm in the `argocd` namespace
-2. Applies the AppProject (RBAC policies)
-3. Applies the two ApplicationSets (services + observability)
+This Helm-installs ArgoCD into the `argocd` namespace, then applies:
 
-After it finishes, get the initial admin password:
-```bash
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath='{.data.password}' | base64 -d && echo
-```
+- `k8s/argocd/appproject.yaml` — the `product-app` AppProject (security guardrail), and
+- `argocd-apps/applicationset-multi-cluster.yaml` — two ApplicationSets that
+  generate the Applications `product-app-services-dev` (from `charts/product-app`)
+  and `product-app-observability-dev` (from `charts/observability`).
 
-Access ArgoCD UI:
-```bash
-kubectl port-forward -n argocd svc/argocd-server 8080:443 &
-# Open: http://127.0.0.1:8080
-# Username: admin
-# Password: (from command above)
-```
-
----
-
-### STEP 7 — Connect ArgoCD to your GitHub repo
-
-In the ArgoCD UI:
-1. Go to **Settings → Repositories → Connect Repo**
-2. Method: **HTTPS**
-3. URL: `https://github.com/princewillopah/product-app.git`
-4. Username: `princewillopah`
-5. Password: your GitHub PAT from Step 1
-6. Click **Connect**
-
-Then go to **Applications** — you should see `product-app-services-dev` and `product-app-observability-dev` syncing automatically.
-
----
-
-### STEP 8 — Validate everything is working
+ArgoCD clones the public repo, renders the charts, and syncs both namespaces
+automatically. Watch them reach `Synced / Healthy`:
 
 ```bash
-cd /home/princewillopah/DevOps/product-app
-
-bash scripts/validate-observability.sh
-```
-
-You should see all checks pass. Then verify services:
-```bash
+kubectl -n argocd get applications
 kubectl get pods -n product-app
 kubectl get pods -n observability-stack
-kubectl get hpa -n product-app
-kubectl get pdb -n product-app
 ```
 
 ---
 
-### STEP 9 — Access the UIs
+## Step 6 — Access the UIs
 
-After Step 5 the port-forwards are already running. Bookmarks:
+NodePort services are already mapped to `localhost`:
 
 | UI | URL | Credentials |
-|----|-----|------------|
-| Grafana | http://127.0.0.1:3000 | admin / prom-operator |
-| Prometheus | http://127.0.0.1:9090 | none |
-| AlertManager | http://127.0.0.1:9093 | none |
-| ArgoCD | http://127.0.0.1:8080 | admin / (from Step 6) |
+|----|-----|-------------|
+| Frontend (admin dashboard) | http://localhost:8080 | — |
+| Storefront | http://localhost:8080/shop | — |
+| API Gateway | http://localhost:8000 | — |
+| Prometheus | http://localhost:9090 | — |
+| Grafana | http://localhost:3000 | `admin` / `prom-operator` |
+| Alertmanager | http://localhost:9093 | — |
+
+ArgoCD, Loki and Tempo are `ClusterIP`; port-forward them:
+
+```bash
+# ArgoCD → https://localhost:8089  (user: admin)
+kubectl -n argocd port-forward svc/argocd-server 8089:443
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d && echo
+
+# Loki / Tempo
+kubectl -n observability-stack port-forward svc/loki 3100:3100
+kubectl -n observability-stack port-forward svc/tempo 3200:3200
+```
+
+> Rotate the initial ArgoCD admin password after first login, then delete the
+> `argocd-initial-admin-secret`.
 
 ---
 
-### What happens after every code change (day-to-day flow)
+## Step 7 — Validate
+
+```bash
+bash scripts/validate-observability.sh   # metrics / logs / traces checks
+bash scripts/test-endpoints.sh           # service endpoint smoke test
+bash scripts/generate-traffic.sh         # optional: synthetic load for dashboards
+```
+
+Then open Grafana and confirm metrics, logs (Loki) and traces (Tempo) are
+flowing.
+
+---
+
+## Day-to-day: what happens on every code change
 
 ```
-You push code → GitHub Actions builds image → pushes to Docker Hub
-→ ArgoCD detects new manifest → auto-deploys to dev cluster
-→ Prometheus scrapes metrics → Grafana shows them
-→ Alert fires if SLO is breached → routes to Slack/PagerDuty
+edit code → git push (images/**)
+   → GitHub Actions builds & pushes 5 images to Docker Hub
+   → CI writes global.image.tag=<sha> back to Git [skip ci]
+   → ArgoCD detects the commit, pulls :<sha>, syncs the cluster
+   → Prometheus scrapes, Grafana shows, alerts route if SLOs break
 ```
 
----
-
-### Summary of the order
-
-| # | Command | Prerequisite |
-|---|---------|-------------|
-| 1 | Create GitHub PAT + Docker Hub token | GitHub + Docker Hub account |
-| 2 | `sed` replace `YOUR_DOCKERHUB_USERNAME` | Docker Hub username known |
-| 3 | Add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` GitHub Action secrets | GitHub repo created |
-| 4 | `git push` to new GitHub repo | Repo created |
-| 5 | `bash scripts/deploy-all.sh --cluster dev` | Images built in CI (Step 4 green) |
-| 6 | `bash scripts/setup-argocd.sh` | Step 5 complete |
-| 7 | Connect repo in ArgoCD UI | Step 6 complete |
-| 8 | `bash scripts/validate-observability.sh` | Step 7 complete |
+You do **not** run `kubectl apply` or `helm install` for app changes. To roll
+back, `git revert` the tag-bump commit and let ArgoCD sync.
 
 ---
 
-If you get stuck at any step, tell me which step and what error you see. I will fix it immediately without another back-and-forth.
+## Order-of-operations cheat sheet
 
-**Accuracy footer**: [certain] on the execution order and what each step does. [likely] that HPA will show `<unknown>` targets until metrics-server is fully warm (~2 min after deploy). No major hallucination risk here.
+| # | Action | Prerequisite |
+|---|--------|--------------|
+| 1 | Add `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` secrets | Docker Hub token created |
+| 2 | Make the 5 Docker Hub repos public | First CI push (repos auto-created) |
+| 3 | `git push` → wait for green CI | Secrets set |
+| 4 | `bash scripts/setup-kind-dev.sh` | docker + kind installed |
+| 5 | `bash scripts/setup-argocd.sh` | Step 4 done |
+| 6 | Open the UIs | Step 5 synced |
+| 7 | `bash scripts/validate-observability.sh` | Step 6 healthy |
+
+If you get stuck, note the step number and the exact error — that's enough to
+diagnose it.

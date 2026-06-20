@@ -1,13 +1,16 @@
-import type { ReactNode } from 'react';
+import { Outlet } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 
-// App shell: fixed sidebar + scrollable content column.
-export function Layout({ children }: { children: ReactNode }) {
+// Admin app shell: fixed sidebar + scrollable content column. The active route
+// renders into the Outlet.
+export function Layout() {
   return (
     <div className="min-h-screen bg-slate-50">
       <Sidebar />
       <div className="pl-64">
-        <main className="min-h-screen">{children}</main>
+        <main className="min-h-screen">
+          <Outlet />
+        </main>
       </div>
     </div>
   );

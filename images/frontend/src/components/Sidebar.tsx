@@ -6,6 +6,7 @@ import {
   BarChart3,
   ExternalLink,
   Boxes,
+  Store,
 } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -60,6 +61,15 @@ export function Sidebar() {
             {label}
           </NavLink>
         ))}
+
+        <NavLink
+          to="/shop"
+          className="group relative mt-1 flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-slate-400 transition-all hover:bg-white/5 hover:text-white"
+        >
+          <Store size={19} />
+          <span className="flex-1">Customer Storefront</span>
+          <ExternalLink size={14} className="text-slate-500" />
+        </NavLink>
 
         <p className="px-3 pb-2 pt-6 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
           Observability

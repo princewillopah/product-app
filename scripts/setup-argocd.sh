@@ -35,7 +35,7 @@ helm upgrade --install argocd argo/argo-cd \
 echo "✅ ArgoCD installed"
 
 echo "📦 Applying ArgoCD project and ApplicationSets..."
-kubectl apply -k "$ROOT_DIR/k8s/argocd"
+kubectl apply -f "$ROOT_DIR/k8s/argocd/appproject.yaml"
 kubectl apply -f "$ROOT_DIR/argocd-apps/applicationset-multi-cluster.yaml"
 
 echo "✅ ArgoCD bootstrap resources applied"

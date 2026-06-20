@@ -8,9 +8,10 @@ on:
     paths:
       - 'images/**'
       - '.github/workflows/build-images.yml'
-      # NOTE: 'k8s/**' is deliberately NOT a trigger. CI writes image tags back
-      # into k8s/, and triggering on k8s/** would make the pipeline retrigger
-      # itself forever. Manifest-only edits should not rebuild images anyway.
+      # NOTE: 'charts/**' is deliberately NOT a trigger. CI writes the image tag
+      # back into charts/product-app/values.yaml, and triggering on charts/**
+      # would make the pipeline retrigger itself forever. Manifest-only edits
+      # should not rebuild images anyway.
   workflow_dispatch:  # Manual trigger
 
 env:
@@ -30,6 +31,7 @@ jobs:
           - analytics-service
           - product-service
           - api-gateway
+          - frontend
     permissions:
       contents: read
 
@@ -96,7 +98,7 @@ jobs:
   # Validation & Smoke Tests
   # ============================================================================
   validate:
-    name: Validate Kubernetes Manifests
+    name: Lint Helm Charts
     runs-on: ubuntu-latest
     needs: build-matrix
     
@@ -104,26 +106,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Validate Kubernetes manifests with kubeval
-      - name: Validate Kubernetes manifests
-        uses: instrumenta/kubeval-action@master
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
         with:
-          files: k8s/
-          strict: true
-          ignore_missing_schemas: false
+          version: v3.16.4
 
-      - name: Lint YAML files
+      # Render + lint both Helm charts. Chart dependencies are vendored
+      # (charts/*/charts/*.tgz committed to Git), so this runs fully offline
+      # with no helm repo access. This is what replaced the old Kustomize +
+      # kubeval validation when the repo moved to Helm + ArgoCD.
+      - name: Helm lint & template (render smoke test)
         run: |
-          sudo apt-get install -y yamllint
-          yamllint -d '{extends: default, rules: {line-length: {max: 120}, comments: {min-spaces-from-content: 1}}}' k8s/**/*.yaml helm-values/**/*.yaml argocd-apps/**/*.yaml
+          for chart in charts/product-app charts/observability; do
+            echo "==> $chart"
+            helm lint "$chart"
+            helm template release "$chart" >/dev/null
+          done
+
+      - name: Lint ArgoCD manifests
+        run: |
+          sudo apt-get update && sudo apt-get install -y yamllint
+          yamllint -d '{extends: default, rules: {line-length: disable, comments: {min-spaces-from-content: 1}, document-start: disable, truthy: disable}}' \
+            argocd-apps/*.yaml k8s/argocd/appproject.yaml
 
   # ============================================================================
   # GitOps Write-Back: pin the new image tag in Git (pull model)
   # ----------------------------------------------------------------------------
   # Instead of pushing to the cluster (which would need cluster credentials in
-  # CI), we commit the freshly-built image's SHA tag into kustomization.yaml.
-  # ArgoCD watches Git and pulls the change on its own. CI never touches the
-  # cluster, tags are immutable, and rollback is just `git revert`.
+  # CI), we commit the freshly-built image's SHA tag into
+  # charts/product-app/values.yaml (global.image.tag). ArgoCD watches Git and
+  # pulls the change on its own. CI never touches the cluster, tags are
+  # immutable, and rollback is just `git revert`.
   # ============================================================================
   update-manifests:
     name: Write Image Tag Back to Git
@@ -143,22 +156,22 @@ jobs:
         id: tag
         run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"   # 7 chars == docker/metadata-action's sha tag
 
-      - name: Pin image tags in kustomization.yaml
+      - name: Pin image tag in Helm values
         run: |
-          sed -i "s|newTag:.*|newTag: ${{ steps.tag.outputs.sha }}|g" k8s/services/kustomization.yaml
-          echo "Pinned image tags:"
-          grep -E 'name:|newTag:' k8s/services/kustomization.yaml
+          yq -i ".global.image.tag = \"${{ steps.tag.outputs.sha }}\"" charts/product-app/values.yaml
+          echo "Pinned global.image.tag:"
+          yq '.global.image' charts/product-app/values.yaml
 
       - name: Commit & push tag bump
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- k8s/services/kustomization.yaml; then
+          if git diff --quiet -- charts/product-app/values.yaml; then
             echo "No tag change — nothing to commit."
             exit 0
           fi
-          git add k8s/services/kustomization.yaml
-          git commit -m "chore(deploy): pin images to ${{ steps.tag.outputs.sha }} [skip ci]"
+          git add charts/product-app/values.yaml
+          git commit -m "chore(deploy): release ${{ steps.tag.outputs.sha }} [skip ci]"
           git push   # GITHUB_TOKEN pushes do NOT retrigger workflows (extra loop guard)
 
   # ============================================================================
@@ -186,11 +199,12 @@ jobs:
           echo "  - analytics-service"
           echo "  - product-service"
           echo "  - api-gateway"
+          echo "  - frontend"
           echo ""
           echo "🔗 Registry: ${{ env.REGISTRY }}"
           echo "📍 Namespace: ${{ env.IMAGE_NAMESPACE }}"
           echo ""
           echo "✅ All images pushed to Docker Hub"
-          echo "✅ Manifests validated"
-          echo "� Image tags written back to Git — ArgoCD will pull & deploy"
+          echo "✅ Helm charts linted & rendered"
+          echo "✅ Image tag written back to Git — ArgoCD will pull & deploy"
 

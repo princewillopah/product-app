@@ -272,6 +272,15 @@ services:
         value: "http://otel-collector.observability-stack:4317"
       - name: OTEL_SERVICE_NAME
         value: "product-service"
+      # Java agent talks OTLP/gRPC to the collector's :4317 receiver (matches the
+      # Go/Python services). Traces only — metrics already go out via
+      # /actuator/prometheus, and we don't ship app logs over OTLP here.
+      - name: OTEL_EXPORTER_OTLP_PROTOCOL
+        value: "grpc"
+      - name: OTEL_METRICS_EXPORTER
+        value: "none"
+      - name: OTEL_LOGS_EXPORTER
+        value: "none"
       - name: MONGO_URI
         value: "mongodb://mongodb:27017/products_db"
       - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE

@@ -14,7 +14,7 @@ global:
   image:
     registry: docker.io
     repository: princewillopah
-    tag: 1157a34
+    tag: face49b
     pullPolicy: IfNotPresent
 # Default RBAC granted to every service ServiceAccount (overridable per service).
 rbac:

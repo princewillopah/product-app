@@ -78,7 +78,9 @@ nodes:
       - containerPort: 30093
         hostPort: 9093
         listenAddress: "127.0.0.1"
-      # ArgoCD
+      # Frontend (admin dashboard + /shop storefront) — frontend Service nodePort 30080.
+      # NOTE: ArgoCD has no NodePort (it's ClusterIP); reach its UI with
+      #       kubectl -n argocd port-forward svc/argocd-server 8089:443
       - containerPort: 30080
         hostPort: 8080
         listenAddress: "127.0.0.1"

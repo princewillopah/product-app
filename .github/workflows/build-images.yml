@@ -126,7 +126,10 @@ jobs:
       - name: Lint ArgoCD manifests
         run: |
           sudo apt-get update && sudo apt-get install -y yamllint
-          yamllint -d '{extends: default, rules: {line-length: disable, comments: {min-spaces-from-content: 1}, document-start: disable, truthy: disable}}' \
+          # comments-indentation is disabled on purpose: the staging/prod blocks in
+          # the ApplicationSet are commented out at list-item indentation so they
+          # stay uncomment-ready, which that rule would otherwise flag.
+          yamllint -d '{extends: default, rules: {line-length: disable, comments: {min-spaces-from-content: 1}, comments-indentation: disable, document-start: disable, truthy: disable}}' \
             argocd-apps/*.yaml k8s/argocd/appproject.yaml
 
   # ============================================================================

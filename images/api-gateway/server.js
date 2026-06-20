@@ -221,6 +221,18 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
+app.patch('/api/orders/:id', async (req, res) => {
+  try {
+    req.logger.info('PATCH /api/orders/:id (proxying to order-service)');
+    const orderServiceUrl = process.env.ORDER_SERVICE_URL || 'http://order-service:8002';
+    const data = await callDownstream('order-service', `${orderServiceUrl}/api/orders/${req.params.id}`, 'PATCH', req.body, { 'x-request-id': req.id });
+    res.json(data);
+  } catch (error) {
+    req.logger.error({ error: error.message }, 'Failed to update order status');
+    res.status(error.response?.status || 500).json({ error: error.message });
+  }
+});
+
 // Analytics Service routes (proxied)
 app.get('/api/analytics/summary', async (req, res) => {
   try {

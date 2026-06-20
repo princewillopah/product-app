@@ -206,7 +206,8 @@ kube-prometheus-stack:
         uid: tempo
         type: tempo
         access: proxy
-        url: http://tempo:3100
+        # Tempo's HTTP query API listens on 3200 (NOT 3100 - that's Loki).
+        url: http://tempo:3200
         jsonData:
           # trace -> logs (Tempo span -> Loki query for that service/trace)
           tracesToLogsV2:

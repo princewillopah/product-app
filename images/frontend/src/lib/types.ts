@@ -24,7 +24,7 @@ export interface ProductInput {
   stock: number;
 }
 
-// order-service (Go, MongoDB) — GET/POST /api/orders (no update/delete in API)
+// order-service (Go, MongoDB) — GET/POST /api/orders, PATCH /api/orders/:id (status)
 export interface Order {
   id: string;
   product_id: string;
@@ -32,6 +32,16 @@ export interface Order {
   total_price: number;
   status: string;
 }
+
+// Allowed order lifecycle states. An order is created as "pending"; an admin
+// moves it through processing/completed (or cancelled) from the dashboard.
+export const ORDER_STATUSES = [
+  'pending',
+  'processing',
+  'completed',
+  'cancelled',
+] as const;
+export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
 // Payload accepted by POST /api/orders.
 export interface OrderInput {

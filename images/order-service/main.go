@@ -80,6 +80,20 @@ type productInfo struct {
 	Price float64 `json:"price"`
 }
 
+// UpdateOrderStatusRequest is the payload for changing an order's status.
+type UpdateOrderStatusRequest struct {
+	Status string `json:"status"`
+}
+
+// allowedOrderStatuses is the set of valid lifecycle states for an order.
+// An order starts as "pending" and an admin moves it through the lifecycle.
+var allowedOrderStatuses = map[string]bool{
+	"pending":    true,
+	"processing": true,
+	"completed":  true,
+	"cancelled":  true,
+}
+
 type ResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -308,6 +322,58 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
 		order.ID, order.ProductID, order.Quantity, order.TotalPrice, order.Status)
 }
 
+// updateOrderStatus moves an existing order to a new lifecycle state
+// (pending -> processing -> completed, or cancelled). This is the admin action
+// behind the status toggle in the dashboard.
+func updateOrderStatus(w http.ResponseWriter, r *http.Request) {
+	l := getLogger(r)
+	id := chi.URLParam(r, "id")
+	l.Info("PATCH /api/orders/{id}", zap.String("order_id", id))
+
+	var payload UpdateOrderStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		l.Error("Invalid status payload", zap.Error(err))
+		http.Error(w, "invalid json payload", http.StatusBadRequest)
+		return
+	}
+
+	status := strings.ToLower(strings.TrimSpace(payload.Status))
+	if !allowedOrderStatuses[status] {
+		l.Error("Invalid order status", zap.String("status", payload.Status))
+		http.Error(w, "status must be one of: pending, processing, completed, cancelled", http.StatusBadRequest)
+		return
+	}
+
+	collection := client.Database("orders_db").Collection("orders")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	var updated Order
+	err := collection.FindOneAndUpdate(
+		ctx,
+		bson.M{"_id": id},
+		bson.M{"$set": bson.M{"status": status, "updated_at": time.Now()}},
+		opts,
+	).Decode(&updated)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			l.Error("Order not found for status update", zap.String("order_id", id))
+			http.Error(w, "order not found", http.StatusNotFound)
+			return
+		}
+		l.Error("Failed to update order status", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	l.Info("Order status updated", zap.String("order_id", id), zap.String("status", status))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"id":"%s","product_id":"%s","quantity":%d,"total_price":%.2f,"status":"%s"}`,
+		updated.ID, updated.ProductID, updated.Quantity, updated.TotalPrice, updated.Status)
+}
+
 func health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -409,6 +475,7 @@ func main() {
 	router.Get("/metrics", promhttp.Handler().ServeHTTP)
 	router.Get("/api/orders", getAllOrders)
 	router.Post("/api/orders", createOrder)
+	router.Patch("/api/orders/{id}", updateOrderStatus)
 
 	// Start server
 	port := os.Getenv("PORT")

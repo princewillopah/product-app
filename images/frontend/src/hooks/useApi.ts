@@ -5,7 +5,7 @@ import {
 } from '@tanstack/react-query';
 import toast from 'react-hot-toast';
 import { api } from '../lib/api';
-import type { ProductInput, OrderInput } from '../lib/types';
+import type { ProductInput, OrderInput, OrderStatus } from '../lib/types';
 
 // Shared query keys — every component that needs products/orders/summary reads
 // THESE keys, so the data is shared from one cache entry. The Dashboard count
@@ -90,5 +90,19 @@ export function useCreateOrder() {
     },
     onError: (e: any) =>
       toast.error(e?.response?.data?.error || 'Failed to place order'),
+  });
+}
+
+export function useUpdateOrderStatus() {
+  const invalidate = useInvalidateAll();
+  return useMutation({
+    mutationFn: ({ id, status }: { id: string; status: OrderStatus }) =>
+      api.updateOrderStatus(id, status),
+    onSuccess: () => {
+      invalidate();
+      toast.success('Order status updated');
+    },
+    onError: (e: any) =>
+      toast.error(e?.response?.data?.error || 'Failed to update status'),
   });
 }

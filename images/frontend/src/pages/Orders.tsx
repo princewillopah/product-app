@@ -1,14 +1,54 @@
 import { useMemo, useState } from 'react';
-import { Plus, ShoppingCart, Hash } from 'lucide-react';
+import { Plus, ShoppingCart, Hash, ChevronDown } from 'lucide-react';
 import { motion } from 'framer-motion';
+import clsx from 'clsx';
 import { Topbar } from '../components/Topbar';
 import { Modal } from '../components/Modal';
 import { OrderForm } from '../components/OrderForm';
-import { Badge, statusTone } from '../components/Badge';
+import { statusClasses } from '../components/Badge';
 import { Skeleton, EmptyState } from '../components/Feedback';
-import { useOrders, useProducts, useCreateOrder } from '../hooks/useApi';
-import type { OrderInput } from '../lib/types';
+import {
+  useOrders,
+  useProducts,
+  useCreateOrder,
+  useUpdateOrderStatus,
+} from '../hooks/useApi';
+import { ORDER_STATUSES } from '../lib/types';
+import type { OrderInput, OrderStatus, Order } from '../lib/types';
 import { formatCurrency, shortId } from '../lib/format';
+
+// Inline, admin-editable status pill. Changing it PATCHes the order and
+// invalidates every query, so the dashboard's "Orders by Status" chart and the
+// stat cards update in lock-step.
+function StatusSelect({ order }: { order: Order }) {
+  const mut = useUpdateOrderStatus();
+  return (
+    <span className="relative inline-flex items-center">
+      <select
+        aria-label="Order status"
+        value={order.status}
+        disabled={mut.isPending}
+        onChange={(e) =>
+          mut.mutate({ id: order.id, status: e.target.value as OrderStatus })
+        }
+        className={clsx(
+          'badge cursor-pointer appearance-none border-0 pr-6 capitalize outline-none transition focus:ring-2 focus:ring-brand-200 disabled:cursor-wait disabled:opacity-60',
+          statusClasses(order.status),
+        )}
+      >
+        {ORDER_STATUSES.map((s) => (
+          <option key={s} value={s} className="capitalize text-slate-700">
+            {s}
+          </option>
+        ))}
+      </select>
+      <ChevronDown
+        size={13}
+        className="pointer-events-none absolute right-1.5 opacity-60"
+      />
+    </span>
+  );
+}
 
 export function Orders() {
   const { data: orders = [], isLoading } = useOrders();
@@ -108,7 +148,7 @@ export function Orders() {
                           {formatCurrency(o.total_price)}
                         </td>
                         <td className="px-5 py-3.5 text-right">
-                          <Badge tone={statusTone(o.status)}>{o.status}</Badge>
+                          <StatusSelect order={o} />
                         </td>
                       </motion.tr>
                     ))}

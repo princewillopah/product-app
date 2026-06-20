@@ -47,6 +47,10 @@ export const api = {
     const { data } = await http.post('/orders', input);
     return data as Order;
   },
+  updateOrderStatus: async (id: string, status: string): Promise<Order> => {
+    const { data } = await http.patch(`/orders/${id}`, { status });
+    return data as Order;
+  },
 
   // ---- Analytics summary (server-derived, matches the lists) ----
   getSummary: async (): Promise<AnalyticsSummary> => {

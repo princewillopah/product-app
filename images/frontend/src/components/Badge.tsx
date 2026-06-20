@@ -32,3 +32,9 @@ export function statusTone(status: string): Tone {
   if (['cancelled', 'failed', 'error'].includes(s)) return 'rose';
   return 'slate';
 }
+
+// Tailwind classes for a status pill, derived from the status tone. Exported so
+// interactive controls (e.g. the order status dropdown) can match the badge look.
+export function statusClasses(status: string): string {
+  return tones[statusTone(status)];
+}

@@ -14,9 +14,8 @@ global:
   image:
     registry: docker.io
     repository: princewillopah
-    tag: latest
+    tag: 1157a34
     pullPolicy: IfNotPresent
-
 # Default RBAC granted to every service ServiceAccount (overridable per service).
 rbac:
   create: true
@@ -27,11 +26,9 @@ rbac:
     - apiGroups: [""]
       resources: ["secrets"]
       verbs: ["get"]
-
 # Common pod annotations for Prometheus pod-scrape discovery (per-service path).
 commonPodAnnotations:
   prometheus.io/scrape: "true"
-
 services:
   # ==========================================================================
   # frontend (React SPA served by nginx) — public UI, no datastore.
@@ -51,7 +48,7 @@ services:
         containerPort: 8080
         protocol: TCP
     service:
-      type: NodePort          # exposed on the host via kind port-map 30080 -> 8080
+      type: NodePort # exposed on the host via kind port-map 30080 -> 8080
       ports:
         - name: http
           port: 8080
@@ -80,7 +77,6 @@ services:
     pdb:
       enabled: true
       minAvailable: 1
-
   # ==========================================================================
   # api-gateway (Node.js) — public entrypoint, no datastore
   # ==========================================================================
@@ -99,7 +95,7 @@ services:
         containerPort: 8080
         protocol: TCP
     service:
-      type: NodePort          # exposed on the host via kind port-map 30000 -> 8000
+      type: NodePort # exposed on the host via kind port-map 30000 -> 8000
       ports:
         - name: http
           port: 8080
@@ -162,7 +158,6 @@ services:
     metrics:
       path: /metrics
       port: http
-
   # ==========================================================================
   # analytics-service (Python/FastAPI) — needs PostgreSQL
   # Dockerfile CMD hardcodes uvicorn --port 8004, so we override the container
@@ -245,7 +240,6 @@ services:
     metrics:
       path: /metrics
       port: http
-
   # ==========================================================================
   # product-service (Java/Spring Boot) — needs MongoDB
   # application.yml sets server.port=8001; SERVER_PORT env overrides it to 8080.
@@ -324,7 +318,6 @@ services:
     metrics:
       path: /actuator/prometheus
       port: http
-
   # ==========================================================================
   # order-service (Go) — needs MongoDB. Hardened pod (non-root, RO rootfs).
   # FIXES vs original manifest:
@@ -518,7 +511,6 @@ services:
     metrics:
       path: /metrics
       port: http
-
 # ============================================================================
 # Datastores (Bitnami subcharts). Dev-grade: no/weak auth, single replica.
 # NOTE: Post-2025 docker.io/bitnami keeps only `latest` tags; pinned version
@@ -527,10 +519,10 @@ services:
 # ============================================================================
 mongodb:
   enabled: true
-  fullnameOverride: mongodb        # -> Service name "mongodb"
+  fullnameOverride: mongodb # -> Service name "mongodb"
   architecture: standalone
   auth:
-    enabled: false                 # apps connect with no credentials
+    enabled: false # apps connect with no credentials
   persistence:
     enabled: true
     size: 2Gi
@@ -541,10 +533,9 @@ mongodb:
     limits:
       cpu: 500m
       memory: 512Mi
-
 postgresql:
   enabled: true
-  fullnameOverride: postgres       # -> primary Service name "postgres"
+  fullnameOverride: postgres # -> primary Service name "postgres"
   auth:
     postgresPassword: postgres
     database: analytics_db
